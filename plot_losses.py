@@ -35,7 +35,7 @@ def read_losses(path: Path) -> tuple[np.ndarray, np.ndarray]:
             losses.append(float(match.group(2)))
     if not steps:
         raise SystemExit(f"no train_loss lines found in {path}")
-    return np.array(steps), np.array(losses)
+    return np.arange(len(losses))+1, np.array(losses)
 
 
 def rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
@@ -46,11 +46,11 @@ def rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("runs", nargs="+")
+    parser.add_argument("--runs", nargs="+")
     parser.add_argument("--window", type=int, default=10)
     parser.add_argument("--output", type=Path, default="loss_plot.png")
     parser.add_argument("--max_steps", type=int, default=None)
-    parser.add_argument("--y_lim", nargs="+", type=float)
+    parser.add_argument("--ylim", nargs="+", type=float)
     args = parser.parse_args()
 
     plt.figure(figsize=(10, 6))
@@ -66,8 +66,8 @@ def main() -> None:
 
     plt.xlabel("step")
     plt.ylabel("train loss")
-    if args.y_lim is not None:
-        plt.ylim(args.y_lim)
+    if args.ylim is not None:
+        plt.ylim(args.ylim)
     plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()
