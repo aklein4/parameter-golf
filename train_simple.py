@@ -630,8 +630,8 @@ class CausalSelfAttention(nn.Module):
         self.q_dim = self.num_heads * self.proj_head_dim
         self.k_dim = self.num_kv_heads * self.proj_head_dim
         self.v_dim = self.num_kv_heads * self.head_dim
-        self.c_qkv = CastedLinear(dim, self.q_dim+self.k_dim+self.v_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        self.c_qkv = CastedLinear(dim, self.q_dim+self.k_dim+self.v_dim, bias=True)
+        self.proj = CastedLinear(dim, dim, bias=True)
         self.proj.init_scale = res_init_scale
         self.q_scales = nn.Parameter(torch.zeros(1, self.num_heads, 1, self.proj_head_dim))
         self.k_scales = nn.Parameter(torch.zeros(1, self.num_kv_heads, 1, self.proj_head_dim))
@@ -714,8 +714,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, res_init_scale: float):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=True)
+        self.proj = CastedLinear(hidden, dim, bias=True)
         self.proj.init_scale = res_init_scale
 
     def forward(self, x: Tensor) -> Tensor:
@@ -828,7 +828,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.logit_controller = CastedLinear(model_dim, 1, bias=False)
+        self.logit_controller = CastedLinear(model_dim, 1, bias=True)
         self.logit_controller.init_scale = res_init_scale
         self.logit_scale = nn.Parameter(torch.ones(1) * res_init_scale)
 
