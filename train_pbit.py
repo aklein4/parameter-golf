@@ -83,7 +83,7 @@ class Hyperparameters:
 
     # Optimizer hyperparameters.
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.001))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.001))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.010))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.030))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
