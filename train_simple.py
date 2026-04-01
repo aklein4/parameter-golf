@@ -94,8 +94,8 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.00))
-    adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.00))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.01))
+    adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.01))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
     lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 100))
 
@@ -339,7 +339,7 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
+        ",".join(CONTROL_TENSOR_NAME_PATTERNS)+",logit_controller"
     ).split(",")
     if pattern
 )
@@ -644,8 +644,8 @@ class CausalSelfAttention(nn.Module):
         self.q_dim = self.num_heads * self.proj_head_dim
         self.k_dim = self.num_kv_heads * self.proj_head_dim
         self.v_dim = self.num_kv_heads * self.head_dim
-        self.c_qkv = CastedLinear(dim, self.q_dim+self.k_dim+self.v_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        self.c_qkv = CastedLinear(dim, self.q_dim+self.k_dim+self.v_dim, bias=True)
+        self.proj = CastedLinear(dim, dim, bias=True)
         self.proj.init_scale = res_init_scale
         self.q_scales = nn.Parameter(torch.zeros(1, self.num_heads, 1, self.proj_head_dim))
         self.k_scales = nn.Parameter(torch.zeros(1, self.num_kv_heads, 1, self.proj_head_dim))
@@ -728,8 +728,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, res_init_scale: float):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=True)
+        self.proj = CastedLinear(hidden, dim, bias=True)
         self.proj.init_scale = res_init_scale
 
     def forward(self, x: Tensor) -> Tensor:
