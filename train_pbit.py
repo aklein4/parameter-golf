@@ -98,7 +98,7 @@ class Hyperparameters:
 
     target_density = float(os.environ.get("TARGET_DENSITY", 0.1))
     minimum_density = float(os.environ.get("MINIMUM_DENSITY", 0.01))
-    density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 100.0))
+    density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 0.0)) # 100.0))
     noise_warmup_steps = int(os.environ.get("NOISE_WARMUP_STEPS", 2000))
 
     mask_emb_dim = int(os.environ.get("MASK_EMB_DIM", 8))
@@ -1205,7 +1205,7 @@ def main() -> None:
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
-    n_params = sum(p.numel() for p in base_model.parameters())
+    n_params = sum(p.numel() for p in base_model.parameters() if not getattr(p, "ignore", False))
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
