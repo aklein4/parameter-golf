@@ -19,8 +19,9 @@ def find_log(run: str) -> Path:
     if path.is_file():
         return path
 
-    matches = sorted(ROOT.glob(f"logs/{run}*"))
-    if len(matches) != 1:
+    matches = ROOT.glob(f"logs/{run}*")
+    matches = sorted(matches, key=lambda x: len(str(x)))
+    if len(matches) == 0:
         raise SystemExit(f"expected 1 match for {run!r}, found {len(matches)}")
     return matches[0]
 
