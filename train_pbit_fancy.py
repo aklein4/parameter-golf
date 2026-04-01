@@ -47,13 +47,13 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", -1)) # 1000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 1)) # 200))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", -1))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 1))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 3)) # 20))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 3))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -506,6 +506,74 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def rect_sigmoid(x: Tensor) -> Tensor:
+    return F.hardsigmoid(6.0 * x - 3.0)
+
+class STEFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x: Tensor) -> Tensor:
+        return (
+            rect_sigmoid(x - 0.05)
+            - rect_sigmoid(-x - 0.05)
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> Tensor:
+        return grad_output
+
+
+class PBitLinear(nn.Module):
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if bias:
+            raise NotImplementedError("PBitLinear does not support bias")
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.scale = math.sqrt(in_features)
+
+        self.weight = nn.Parameter(
+            (2.0 * torch.rand(out_features, in_features) - 1.0) / self.scale
+        )
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        mean, var = self.get_mean_var(self.weight)
+        mean = mean.to(x.dtype)
+        var = var.to(x.dtype)
+
+        m = F.linear(x, mean, bias=None)
+        v = F.linear(x.square(), var, bias=None)
+
+        return m + torch.randn_like(v) * torch.sqrt(v + 1e-6)
+
+
+    def get_mean_var(self, raw: Tensor) -> tuple[Tensor, Tensor]:
+        og_dtype = raw.dtype
+  
+        w = STEFunction.apply(raw.bfloat16() * self.scale)
+        p = w.abs()
+
+        var = torch.minimum(
+            p * (1.0 - p),
+            10 * (0.5 - torch.abs(p - 0.5))
+        )
+
+        return w.to(og_dtype), var.to(og_dtype)
+
+    
+    def clamp_weight(self, raw: Tensor) -> None:
+        raw.clamp_(-1.1 / self.scale, 1.1 / self.scale)
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
@@ -546,10 +614,23 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, mask_emb: Tensor) -> Tensor:
+    x_rot, x_pass = x[..., :2*cos.size(-1)], x[..., 2*cos.size(-1):] # :-mask_emb.size(-1)]
+    
+    half = x_rot.size(-1) // 2
+    x1, x2 = x_rot[..., :half], x_rot[..., half:]
+
+    mask_emb = mask_emb[:, None].repeat(1, x.size(1), 1, 1)
+
+    return torch.cat(
+        [
+            x1 * cos + x2 * sin,
+            x1 * (-sin) + x2 * cos,
+            x_pass,
+            mask_emb,
+        ],
+        dim=-1
+    )
 
 
 class CausalSelfAttention(nn.Module):
@@ -578,19 +659,30 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim//2, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+        self.sink_k = nn.Parameter(torch.zeros((1, self.num_kv_heads, 1, self.head_dim), dtype=torch.float32))
+        self.sink_v = nn.Parameter(torch.zeros((1, self.num_kv_heads, 1, self.head_dim), dtype=torch.float32))
+
+    def forward(self, x: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
+        
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        
+        q = F.rms_norm(q[..., :-8], (q.size(-1)-8,))
+        k = F.rms_norm(k[..., :-8], (k.size(-1)-8,))
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        
+        q = apply_rotary_emb(q, cos, sin, mask_emb_q)
+        k = apply_rotary_emb(k, cos, sin, mask_emb_k)
+        
+        k = torch.cat([k[:, :, :-1], self.sink_k.repeat(k.shape[0], 1, 1, 1)], dim=-2)
+        v = torch.cat([v[:, :, :-1], self.sink_v.repeat(v.shape[0], 1, 1, 1)], dim=-2)
+
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -599,7 +691,9 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        
         return self.proj(y)
 
 
@@ -636,13 +730,32 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), mask_emb_q, mask_emb_k)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
+
+
+# class StackedSequential(nn.Module):
+
+#     def __init__(self, modules: list[nn.Module]):
+#         super().__init__()
+
+#         self.modules_list = nn.ModuleList(modules)
+
+#         state_dicts = [mod.state_dict() for mod in self.modules_list]
+
+#         stacked_state_dict = {}
+#         for key in state_dicts[0].keys():
+
+#             stacked_state_dict[key] = torch.stack([sd[key] for sd in state_dicts], dim=0)
+        
+#             for mod in self.modules_list:
+#                 mod.set
+        
 
 
 class GPT(nn.Module):
@@ -659,6 +772,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mask_emb_dim: int = 8,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -690,6 +804,31 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self._init_weights()
 
+        self._init_mask_emb(mask_emb_dim)
+
+    def _init_mask_emb(self, d) -> None:
+        self.mask_emb_dim = d
+
+        q_emb = 1.0 - torch.eye(d)
+        k_emb = torch.masked_fill(
+            torch.zeros(d, d),
+            torch.eye(d, dtype=torch.bool),
+            -100.0
+        )
+
+        self.register_buffer("mask_emb_q_weight", q_emb, persistent=False)
+        self.register_buffer("mask_emb_k_weight", k_emb, persistent=False)
+
+    def get_mask_emb(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        
+        seq_index = ((input_ids == 1).long().cumsum(-1)).clamp(max=self.mask_emb_dim - 1)
+
+        mask_emb_q = F.embedding(seq_index, self.mask_emb_q_weight)
+        mask_emb_k = F.embedding(seq_index, self.mask_emb_k_weight)
+
+        return mask_emb_q, mask_emb_k
+
+
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -698,6 +837,8 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        mask_emb_q, mask_emb_k = self.get_mask_emb(input_ids)
+        
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -705,12 +846,12 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, mask_emb_q, mask_emb_k)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, mask_emb_q, mask_emb_k)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -773,6 +914,8 @@ def main() -> None:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
         print(logfile)
+        if os.path.exists(logfile):
+            os.remove(logfile)
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
