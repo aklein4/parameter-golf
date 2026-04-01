@@ -27,6 +27,18 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+"""
+-----------------------------
+CHECKLIST
+[x] Implement noisy PBitLinear and density loss
+[ ] PBit post-training and eval quantization
+[ ] Switch to more standard transformer architecture
+[ ] ScaledMuon optimizer and corresponding hyperparameters
+[ ] Stacked block parameters
+[ ] Inter-context masking and attention sink
+-----------------------------
+"""
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -47,24 +59,23 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", -1))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 1))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", -1)) # 1000))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 1)) # 200))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 3))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 3)) # 20))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024 * 256))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_layers = int(os.environ.get("NUM_LAYERS", 24))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
+    num_heads = int(os.environ.get("NUM_HEADS", 12))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -75,7 +86,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.01))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -86,6 +97,27 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    target_density = float(os.environ.get("TARGET_DENSITY", 0.1))
+    minimum_density = float(os.environ.get("MINIMUM_DENSITY", 0.01))
+    density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 100.0))
+    noise_warmup_steps = int(os.environ.get("NOISE_WARMUP_STEPS", 1000))
+
+# -----------------------------
+# PYTORCH UTILITIES
+# -----------------------------
+
+def linear_step(x: Tensor | float) -> torch.Tensor | float:
+    if isinstance(x, torch.Tensor):
+        return torch.clamp(x, 0.0, 1.0)
+    return max(0.0, min(1.0, x))
+
+
+def cosine_step(x: Tensor | float) -> torch.Tensor | float:
+    t = linear_step(x)
+    if isinstance(t, torch.Tensor):
+        return 0.5 * (1 - torch.cos(t * math.pi))
+    return 0.5 * (1 - math.cos(t * math.pi))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -93,20 +125,25 @@ class Hyperparameters:
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+
+    X = G.float()
     X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
+    X = X.to(G.dtype)
+
+    transposed = G.size(-2) > G.size(-1)
     if transposed:
-        X = X.T
+        X = X.mT
+
     for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
-    return X.T if transposed else X
+
+    return X.mT if transposed else X
 
 
 class Muon(torch.optim.Optimizer):
@@ -150,9 +187,9 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    g = zeropower_via_newtonschulz5(g.bfloat16(), steps=backend_steps)
+                    # Scale dMuon correction
+                    g *= 0.2 * math.sqrt(max(g.shape[0], g.shape[1]))
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -289,7 +326,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "in_scale,out_shift,out_scale,q_scales,k_scales",
     ).split(",")
     if pattern
 )
@@ -506,16 +543,13 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-def rect_sigmoid(x: Tensor) -> Tensor:
-    return F.hardsigmoid(6.0 * x - 3.0)
-
 class STEFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
         return (
-            rect_sigmoid(x - 0.05)
-            - rect_sigmoid(-x - 0.05)
+            linear_step(x - 0.05)
+            - linear_step(-x - 0.05)
         )
 
     @staticmethod
@@ -529,37 +563,67 @@ class PBitLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        bias: bool = False,
+        target_density: float,
+        minimum_density: float,
     ):
         super().__init__()
-        if bias:
-            raise NotImplementedError("PBitLinear does not support bias")
 
         self.in_features = in_features
         self.out_features = out_features
 
+        self.target_density = target_density
+        self.minimum_density = minimum_density
+
         self.scale = math.sqrt(in_features)
 
         self.weight = nn.Parameter(
-            (2.0 * torch.rand(out_features, in_features) - 1.0) / self.scale
+            (2.0 * torch.rand(out_features, in_features) - 1.0) # in [-1, 1]
+            * 2.0 # account for E[|U(-1,1)|] = 0.5
+            * self.target_density # scale L1 norm
+            / self.scale # parameter scale
+        )
+
+        self.in_scale = nn.Parameter(
+            torch.zeros(in_features)
+        )
+        self.out_shift = nn.Parameter(
+            torch.zeros(out_features)
+        )
+        self.out_scale = nn.Parameter(
+            torch.zeros(out_features)
         )
 
 
-    def forward(self, x: Tensor) -> Tensor:
-        mean, var = self.get_mean_var(self.weight)
-        mean = mean.to(x.dtype)
+    def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
+        
+        mean, var = self.get_mean_var()
+        mean = mean.to(x.dtype) # see CastedLinear
         var = var.to(x.dtype)
+
+        x = (1.0 + self.in_scale.to(x.dtype)) * x
+
+        x_mean = torch.mean(x, dim=[0,1], keepdim=True)
+        x = x - x_mean
 
         m = F.linear(x, mean, bias=None)
         v = F.linear(x.square(), var, bias=None)
 
-        return m + torch.randn_like(v) * torch.sqrt(v + 1e-6)
+        out_mean = F.linear(x_mean, mean, bias=None)
+        m = m + out_mean
+
+        noise = noise_scale * torch.randn_like(v)
+        y = m + noise * torch.sqrt(v + 1e-6)
+
+        y = (1.0 + self.out_scale.to(y.dtype)) * y + self.out_shift.to(m.dtype)
+
+        return y
 
 
-    def get_mean_var(self, raw: Tensor) -> tuple[Tensor, Tensor]:
-        og_dtype = raw.dtype
-  
-        w = STEFunction.apply(raw.bfloat16() * self.scale)
+    def get_mean_var(self) -> tuple[Tensor, Tensor]:
+        og_dtype = self.weight.dtype
+
+        # scale brings up to unit range
+        w = STEFunction.apply(self.weight.bfloat16() * self.scale)
         p = w.abs()
 
         var = torch.minimum(
@@ -567,11 +631,37 @@ class PBitLinear(nn.Module):
             10 * (0.5 - torch.abs(p - 0.5))
         )
 
+        # unit in -> unit out scaling
+        row_scales = 1 / (torch.norm(w.float(), dim=1, keepdim=True) + 1e-6).to(w.dtype)
+        w = w * row_scales
+        var = var * row_scales.square()
+
         return w.to(og_dtype), var.to(og_dtype)
 
     
-    def clamp_weight(self, raw: Tensor) -> None:
-        raw.clamp_(-1.1 / self.scale, 1.1 / self.scale)
+    @torch.no_grad()
+    def clamp_weight(self) -> None:
+        self.weight.clamp_(-1.1 / self.scale, 1.1 / self.scale)
+
+
+    def get_density(self) -> Tensor:
+
+        w = STEFunction.apply(self.weight.bfloat16() * self.scale)
+        p = w.abs()
+
+        row_density = p.mean(dim=1, keepdim=True)
+        column_density = p.mean(dim=0, keepdim=True)
+        mask = (
+            (row_density < self.minimum_density) |
+            (column_density < self.minimum_density)
+        )
+
+        p = torch.where(
+            mask, p.detach(), p
+        )
+
+        return p.sum(), p.numel()
+
 
 
 class CastedLinear(nn.Linear):
@@ -614,23 +704,10 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, mask_emb: Tensor) -> Tensor:
-    x_rot, x_pass = x[..., :2*cos.size(-1)], x[..., 2*cos.size(-1):] # :-mask_emb.size(-1)]
-    
-    half = x_rot.size(-1) // 2
-    x1, x2 = x_rot[..., :half], x_rot[..., half:]
-
-    mask_emb = mask_emb[:, None].repeat(1, x.size(1), 1, 1)
-
-    return torch.cat(
-        [
-            x1 * cos + x2 * sin,
-            x1 * (-sin) + x2 * cos,
-            x_pass,
-            mask_emb,
-        ],
-        dim=-1
-    )
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -640,7 +717,8 @@ class CausalSelfAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         rope_base: float,
-        qk_gain_init: float,
+        target_density: float,
+        minimum_density: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -653,35 +731,27 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim//2, base=rope_base)
+        self.c_q = PBitLinear(dim, dim, target_density, minimum_density)
+        self.c_k = PBitLinear(dim, kv_dim, target_density, minimum_density)
+        self.c_v = PBitLinear(dim, kv_dim, target_density, minimum_density)
+        self.proj = PBitLinear(dim, dim, target_density, minimum_density)
+        self.q_scales = nn.Parameter(torch.zeros(1, self.num_heads, 1, self.head_dim))
+        self.k_scales = nn.Parameter(torch.zeros(1, self.num_kv_heads, 1, self.head_dim))
+        self.rotary = Rotary(self.head_dim, base=rope_base)
 
-        self.sink_k = nn.Parameter(torch.zeros((1, self.num_kv_heads, 1, self.head_dim), dtype=torch.float32))
-        self.sink_v = nn.Parameter(torch.zeros((1, self.num_kv_heads, 1, self.head_dim), dtype=torch.float32))
-
-    def forward(self, x: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
+    def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x, noise_scale).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x, noise_scale).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x, noise_scale).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
-        q = F.rms_norm(q[..., :-8], (q.size(-1)-8,))
-        k = F.rms_norm(k[..., :-8], (k.size(-1)-8,))
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q = F.rms_norm(q, (q.size(-1),)) * (1.0 + self.q_scales.to(q.dtype))
+        k = F.rms_norm(k, (k.size(-1),)) * (1.0 + self.k_scales.to(k.dtype))
         
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        
-        q = apply_rotary_emb(q, cos, sin, mask_emb_q)
-        k = apply_rotary_emb(k, cos, sin, mask_emb_k)
-        
-        k = torch.cat([k[:, :, :-1], self.sink_k.repeat(k.shape[0], 1, 1, 1)], dim=-2)
-        v = torch.cat([v[:, :, :-1], self.sink_v.repeat(v.shape[0], 1, 1, 1)], dim=-2)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
 
         y = F.scaled_dot_product_attention(
             q,
@@ -691,24 +761,32 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         
-        return self.proj(y)
+        return self.proj(y, noise_scale)
+
+
+def sqelu(x: Tensor) -> Tensor:
+    neg = x.clamp_max(0.0)
+    pos = x.clamp_min(0.0)
+
+    left = F.silu(neg)
+    right = (pos.square() + 0.5*pos)
+
+    return left + right
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+
+    def __init__(self, dim: int, mlp_mult: int, target_density: float, minimum_density: float):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.fc = PBitLinear(dim, hidden, target_density, minimum_density)
+        self.proj = PBitLinear(hidden, dim, target_density, minimum_density)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+    def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
+        x = sqelu(self.fc(x, noise_scale))
+        return self.proj(x, noise_scale)
 
 
 class Block(nn.Module):
@@ -719,43 +797,19 @@ class Block(nn.Module):
         num_kv_heads: int,
         mlp_mult: int,
         rope_base: float,
-        qk_gain_init: float,
+        target_density: float,
+        minimum_density: float,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
+        self.attn_norm = RMSNorm() # matrices have in_scales for affine
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, target_density, minimum_density)
+        self.mlp = MLP(dim, mlp_mult, target_density, minimum_density)
 
-    def forward(self, x: Tensor, x0: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), mask_emb_q, mask_emb_k)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+    def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
+        x = x + self.attn(self.attn_norm(x), noise_scale)
+        x = x + self.mlp(self.mlp_norm(x), noise_scale)
         return x
-
-
-# class StackedSequential(nn.Module):
-
-#     def __init__(self, modules: list[nn.Module]):
-#         super().__init__()
-
-#         self.modules_list = nn.ModuleList(modules)
-
-#         state_dicts = [mod.state_dict() for mod in self.modules_list]
-
-#         stacked_state_dict = {}
-#         for key in state_dicts[0].keys():
-
-#             stacked_state_dict[key] = torch.stack([sd[key] for sd in state_dicts], dim=0)
-        
-#             for mod in self.modules_list:
-#                 mod.set
-        
 
 
 class GPT(nn.Module):
@@ -771,8 +825,9 @@ class GPT(nn.Module):
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
-        qk_gain_init: float,
-        mask_emb_dim: int = 8,
+        target_density: float,
+        minimum_density: float,
+        density_loss_scale: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -781,10 +836,10 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        
+        self.target_density = target_density
+        self.density_loss_scale = density_loss_scale
+        
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -793,76 +848,69 @@ class GPT(nn.Module):
                     num_kv_heads,
                     mlp_mult,
                     rope_base,
-                    qk_gain_init,
+                    target_density,
+                    minimum_density,
                 )
                 for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        if self.lm_head is not None:
-            self.lm_head._zero_init = True
-        self._init_weights()
-
-        self._init_mask_emb(mask_emb_dim)
-
-    def _init_mask_emb(self, d) -> None:
-        self.mask_emb_dim = d
-
-        q_emb = 1.0 - torch.eye(d)
-        k_emb = torch.masked_fill(
-            torch.zeros(d, d),
-            torch.eye(d, dtype=torch.bool),
-            -100.0
-        ) 
-
-        self.register_buffer("mask_emb_q_weight", q_emb, persistent=False)
-        self.register_buffer("mask_emb_k_weight", k_emb, persistent=False)
-
-    def get_mask_emb(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
         
-        seq_index = ((input_ids == 1).long().cumsum(-1)).clamp(max=self.mask_emb_dim - 1)
-
-        mask_emb_q = F.embedding(seq_index, self.mask_emb_q_weight)
-        mask_emb_k = F.embedding(seq_index, self.mask_emb_k_weight)
-
-        return mask_emb_q, mask_emb_k
-
+        self._init_weights()
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(0.0, math.sqrt(1/module.in_features))
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        mask_emb_q, mask_emb_k = self.get_mask_emb(input_ids)
+    def forward(self, input_ids: Tensor, target_ids: Tensor, noise_scale: Tensor = 1.0) -> Tensor:
         
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0, mask_emb_q, mask_emb_k)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0, mask_emb_q, mask_emb_k)
-
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        for block in self.blocks:
+            x = block(x, noise_scale)
+        x = self.final_norm(x)
+        
+        x = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
+
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+        
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        density = self.get_density()
+        density_loss = F.huber_loss(self.density_loss_scale * F.relu(density - self.target_density), torch.zeros_like(density))
+        loss = loss + density_loss - density_loss.detach()
+
+        return loss
+
+
+    def get_density(self) -> Tensor:
+        total_p = 0.0
+        total_count = 0
+        for module in self.modules():
+            if isinstance(module, PBitLinear):
+                p_sum, numel = module.get_density()
+                total_p = total_p + p_sum
+                total_count = total_count + numel
+        return total_p / total_count
+
+
+    @torch.no_grad()    
+    def clamp_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, PBitLinear):
+                module.clamp_weight()
 
 
 # -----------------------------
@@ -977,10 +1025,12 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
+        target_density=args.target_density,
+        minimum_density=args.minimum_density,
+        density_loss_scale=args.density_loss_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, PBitLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1000,12 +1050,10 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
@@ -1081,6 +1129,7 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        noise_scale = torch.ones((), device=device)
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1088,7 +1137,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, noise_scale)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1151,12 +1200,13 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        noise_scale = 0.0 * linear_step(torch.ones((), device=device) * step / args.noise_warmup_steps)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, noise_scale)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1175,6 +1225,7 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        base_model.clamp_weights()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1185,7 +1236,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"density:{base_model.get_density().item():.4f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
