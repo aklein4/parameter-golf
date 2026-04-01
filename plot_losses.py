@@ -63,7 +63,7 @@ def main() -> None:
             steps = steps[mask]
             losses = losses[mask]
         (line,) = plt.plot(steps, losses, alpha=0.25, linewidth=1)
-        plt.plot(steps, rolling_mean(losses, args.window), color=line.get_color(), linewidth=3, label=run)
+        plt.plot(steps, rolling_mean(losses, args.window), color=line.get_color(), linewidth=2, label=run)
 
     plt.xlabel("step")
     plt.ylabel("train loss")
