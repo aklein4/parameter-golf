@@ -582,6 +582,9 @@ class PBitLinear(nn.Module):
             * self.target_density # scale L1 norm
             / self.scale # parameter scale
         )
+        self.weight.is_pbit = True
+        self.weight.pbit_scale = self.scale
+        self.weight.minimum_density = minimum_density
 
         self.in_scale = nn.Parameter(
             torch.zeros(in_features)
@@ -600,8 +603,6 @@ class PBitLinear(nn.Module):
         mean = mean.to(x.dtype) # see CastedLinear
         var = var.to(x.dtype)
 
-        x = (1.0 + self.in_scale.to(x.dtype)) * x
-
         x_mean = torch.mean(x, dim=[0,1], keepdim=True)
         x = x - x_mean
 
@@ -609,12 +610,10 @@ class PBitLinear(nn.Module):
         v = F.linear(x.square(), var, bias=None)
 
         out_mean = F.linear(x_mean, mean, bias=None)
-        m = m + out_mean
+        m = m + out_mean + self.out_shift.to(m.dtype)
 
         noise = noise_scale * torch.randn_like(v)
         y = m + noise * torch.sqrt(v + 1e-6)
-
-        y = (1.0 + self.out_scale.to(y.dtype)) * y + self.out_shift.to(y.dtype)
 
         return y
 
@@ -632,34 +631,40 @@ class PBitLinear(nn.Module):
 
         # unit in -> unit out scaling
         row_scales = 1 / (torch.norm(w.float(), dim=1, keepdim=True) + 1e-6).to(w.dtype)
-        w = w * row_scales
-        var = var * row_scales.square()
+        matrix_scale = (
+            (1.0 + self.in_scale.to(w.dtype))[None, :] *
+            (1.0 + self.out_scale.to(w.dtype))[:, None] *
+            row_scales
+        )
+        
+        w = w * matrix_scale
+        var = var * matrix_scale.square()
 
         return w, var
 
     
-    @torch.no_grad()
-    def clamp_weight(self) -> None:
-        self.weight.clamp_(-1.1 / self.scale, 1.1 / self.scale)
+@torch.no_grad()
+def clamp_weight(weight) -> None:
+    weight.clamp_(-1.1 / weight.pbit_scale, 1.1 / weight.pbit_scale)
 
 
-    def get_density(self, p=None) -> Tensor:
+def get_density(weight) -> Tensor:
 
-        w = STEFunction.apply(self.weight.bfloat16() * self.scale)
-        p = w.abs()
+    w = STEFunction.apply(weight.bfloat16() * weight.pbit_scale)
+    p = w.abs()
 
-        row_density = p.mean(dim=1, keepdim=True)
-        column_density = p.mean(dim=0, keepdim=True)
-        mask = (
-            (row_density < self.minimum_density) |
-            (column_density < self.minimum_density)
-        )
+    row_density = p.mean(dim=1, keepdim=True)
+    column_density = p.mean(dim=0, keepdim=True)
+    mask = (
+        (row_density < weight.minimum_density) |
+        (column_density < weight.minimum_density)
+    )
 
-        p = torch.where(
-            mask, p.detach(), p
-        )
+    p = torch.where(
+        mask, p.detach(), p
+    )
 
-        return p.sum().float(), p.numel()
+    return p.sum().float(), p.numel()
 
 
 
@@ -832,17 +837,6 @@ class Block(nn.Module):
         return x
 
 
-def set_to_none(module: nn.Module, name: str, is_buffer: bool) -> None:
-    return
-    parts = name.split(".")
-    parent = module.get_submodule(".".join(parts[:-1])) if len(parts) > 1 else module
-
-    if is_buffer:
-        parent.register_buffer(parts[-1], None, persistent=False)
-    else:
-        parent.register_parameter(parts[-1], None)
-
-
 class StackedLayers(nn.Module):
 
     def __init__(self, layers: list[nn.Module]):
@@ -858,9 +852,16 @@ class StackedLayers(nn.Module):
         
         for key in self.param_names:
             
+            ref = param_dicts[0][key]
             x = torch.stack([d[key].data for d in param_dicts], dim=0)
+            
             p = nn.Parameter(x)
-            p.is_2d = param_dicts[0][key].ndim == 2
+            p.is_pbit = getattr(ref, "is_pbit", False)
+            if p.is_pbit:
+                p.pbit_scale = ref.pbit_scale
+                p.minimum_density = ref.minimum_density
+            
+            p.is_2d = ref.ndim == 2
 
             self.register_parameter(key.replace(".", "___"), p)
             for d in param_dicts:
@@ -878,7 +879,7 @@ class StackedLayers(nn.Module):
 
 
     def forward(self, x: Tensor, *args, **kwargs) -> Tensor:
-        
+
         for i, layer in enumerate(self.layers):
             x = torch.func.functional_call(
                 layer,
@@ -977,19 +978,19 @@ class GPT(nn.Module):
     def get_density(self) -> Tensor:
         total_p = 0.0
         total_count = 0
-        for module in self.modules():
-            if isinstance(module, PBitLinear):
-                p_sum, numel = module.get_density()
+        for p in self.parameters():
+            if getattr(p, "is_pbit", False) and not getattr(p, "ignore", False):
+                p_sum, numel = get_density(p)
                 total_p = total_p + p_sum
                 total_count = total_count + numel
-        return total_p / total_count
+        return total_p / (total_count + 1e-6)
 
 
     @torch.no_grad()    
     def clamp_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, PBitLinear):
-                module.clamp_weight()
+        for p in self.parameters():
+            if getattr(p, "is_pbit", False) and not getattr(p, "ignore", False):
+                clamp_weight(p)
 
 
 # -----------------------------
