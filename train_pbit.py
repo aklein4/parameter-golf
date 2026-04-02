@@ -18,6 +18,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
+from tqdm import tqdm
 
 import numpy as np
 import sentencepiece as spm
@@ -83,7 +84,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
-    matrix_lr = float(os.environ.get("MATRIX_LR", 5e-4))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 1e-3))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", matrix_lr))
     scalar_lr = float(os.environ.get("SCALAR_LR", math.sqrt(model_dim) * matrix_lr))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
@@ -98,9 +99,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
     lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 100))
     
-    target_density = float(os.environ.get("TARGET_DENSITY", 0.2))
+    target_density = float(os.environ.get("TARGET_DENSITY", 0.20))
     minimum_density = float(os.environ.get("MINIMUM_DENSITY", 0.01))
-    density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 0.0)) # 100.0))
+    density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 100.0))
     noise_warmup_steps = int(os.environ.get("NOISE_WARMUP_STEPS", 2000))
 
     res_init_scale: float = float(os.environ.get("RES_INIT_SCALE", 0.01))
@@ -294,8 +295,9 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
+    noise_scale = torch.ones((), device=device)
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+        for batch_seq_start in tqdm(range(seq_start, seq_end, local_batch_seqs), desc="val"):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
             raw_end = batch_seq_end * args.train_seq_len + 1
@@ -303,7 +305,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y, noise_scale).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -381,7 +383,8 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    # clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    clip_abs = float(torch.max(t32.abs().flatten()).item()) if t32.numel() else 0.0 # use max for now
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
@@ -620,6 +623,21 @@ class PBitLinear(nn.Module):
 
     def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
         
+        if not self.training:
+
+            mean, _ = self.get_mean_var()
+            b = self.sample_weight()
+
+            x_mean = torch.mean(x, dim=[0,1], keepdim=True)
+            x = x - x_mean
+
+            y = F.linear(x, b, bias=None)
+            out_mean = F.linear(x_mean, mean, bias=None)
+
+            y = y + out_mean + self.out_shift.to(y.dtype)
+
+            return y
+
         mean, var = self.get_mean_var()
         mean = mean.to(x.dtype) # see CastedLinear
         var = var.to(x.dtype)
@@ -662,6 +680,23 @@ class PBitLinear(nn.Module):
         var = var * matrix_scale.square()
 
         return w, var
+
+
+    def sample_weight(self) -> Tensor:
+        
+        w = STEFunction.apply(self.weight * self.scale)
+        p = w.abs()
+
+        b = torch.sign(w) * torch.bernoulli(p).to(w.dtype)
+
+        row_scales = 1 / (torch.norm(w.float(), dim=1, keepdim=True) + 1e-6)
+        matrix_scale = (
+            (1.0 + self.in_scale.to(b.dtype))[None, :] *
+            (1.0 + self.out_scale.to(b.dtype))[:, None] *
+            row_scales.to(b.dtype)
+        )
+
+        return b * matrix_scale
 
     
 @torch.no_grad()
@@ -1060,8 +1095,8 @@ class GPT(nn.Module):
         
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
-        log_target_density = math.log(self.target_density)
-        target_density = torch.exp(noise_scale * log_target_density)
+        log_target_density = math.log(2.0 * self.target_density)
+        target_density = 0.5 * torch.exp(noise_scale * log_target_density)
 
         density = self.get_density()
         density_loss = F.huber_loss(self.density_loss_scale * F.relu(density - target_density), torch.zeros_like(density))
