@@ -69,8 +69,8 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 3)) # 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024 * 512))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024 * 256))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model shape.
@@ -1119,7 +1119,7 @@ def main() -> None:
     def lr_mul(step: int, elapsed_ms: float) -> float:
         return (
             linear_step(step / args.lr_warmup_steps) *
-            (1.0 - linear_step(elapsed_ms / max_wallclock_ms))
+            (1.0 - cosine_step(elapsed_ms / max_wallclock_ms))
         )
         if args.warmdown_iters <= 0:
             return 1.0
