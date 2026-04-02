@@ -1545,3 +1545,79 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.10.12 (main, May 27 2025, 17:12:29) [GCC 11.4.0]
+Running PyTorch 2.7.0
+Thu Apr  2 20:21:39 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.148.08             Driver Version: 570.148.08     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GH200 480GB             On  |   00000000:DD:00.0 Off |                    0 |
+| N/A   35C    P0             88W /  700W |       8MiB /  97871MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+Matrix params:
+  blocks.attn___c_qkv___weight: (16, 1952, 1024)
+  blocks.attn___proj___weight: (16, 1024, 1024)
+  blocks.mlp___fc___weight: (16, 2048, 1024)
+  blocks.mlp___proj___weight: (16, 1024, 2048)
+Scalar params:
+  logit_scale: (1,)
+  blocks.attn___q_scales: (16, 1, 8, 1, 120)
+  blocks.attn___k_scales: (16, 1, 4, 1, 120)
+  blocks.attn___c_qkv___in_scale: (16, 1024)
+  blocks.attn___c_qkv___out_shift: (16, 1952)
+  blocks.attn___c_qkv___out_scale: (16, 1952)
+  blocks.attn___proj___in_scale: (16, 1024)
+  blocks.attn___proj___out_shift: (16, 1024)
+  blocks.attn___proj___out_scale: (16, 1024)
+  blocks.mlp___fc___in_scale: (16, 1024)
+  blocks.mlp___fc___out_shift: (16, 2048)
+  blocks.mlp___fc___out_scale: (16, 2048)
+  blocks.mlp___proj___in_scale: (16, 2048)
+  blocks.mlp___proj___out_shift: (16, 1024)
+  blocks.mlp___proj___out_scale: (16, 1024)
+model_params:117_214_721
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.001 matrix_lr:0.001 scalar_lr:0.032
+train_batch_tokens:262144 train_seq_len:2048 iterations:20000 warmup_steps:3 max_wallclock_seconds:4800.000
+seed:1337
+warmup_step:1/3
+warmup_step:2/3
+warmup_step:3/3
+step:1/20000 train_loss:7.4908 train_time:1430ms step_avg:1430.2ms density:0.500 confidence:0.818 
+step:2/20000 train_loss:7.4817 train_time:2788ms step_avg:1393.9ms density:0.500 confidence:0.818 
+step:3/20000 train_loss:7.1790 train_time:4208ms step_avg:1402.6ms density:0.500 confidence:0.818 
+step:4/20000 train_loss:6.8133 train_time:5628ms step_avg:1406.9ms density:0.500 confidence:0.818 
+step:5/20000 train_loss:6.5474 train_time:7043ms step_avg:1408.6ms density:0.500 confidence:0.818 
+step:6/20000 train_loss:6.3652 train_time:8463ms step_avg:1410.6ms density:0.500 confidence:0.818 
+step:7/20000 train_loss:6.2515 train_time:9885ms step_avg:1412.1ms density:0.500 confidence:0.818 
+step:8/20000 train_loss:6.1239 train_time:11301ms step_avg:1412.7ms density:0.500 confidence:0.818 
+step:9/20000 train_loss:6.0424 train_time:12717ms step_avg:1413.0ms density:0.500 confidence:0.818 
+step:10/20000 train_loss:5.9718 train_time:14134ms step_avg:1413.4ms density:0.500 confidence:0.818 
+step:11/20000 train_loss:5.8995 train_time:15553ms step_avg:1413.9ms density:0.500 confidence:0.818 
+step:12/20000 train_loss:5.8039 train_time:16972ms step_avg:1414.3ms density:0.500 confidence:0.818 
+step:13/20000 train_loss:5.7076 train_time:18392ms step_avg:1414.8ms density:0.500 confidence:0.818 
+step:14/20000 train_loss:5.6324 train_time:19812ms step_avg:1415.1ms density:0.500 confidence:0.818 
+step:15/20000 train_loss:5.5405 train_time:21232ms step_avg:1415.5ms density:0.500 confidence:0.818 
+step:16/20000 train_loss:5.4402 train_time:22656ms step_avg:1416.0ms density:0.500 confidence:0.818 
