@@ -1089,7 +1089,7 @@ class GPT(nn.Module):
                 flip_sum, numel = get_confidence(p)
                 total_flip = total_flip + flip_sum
                 total_count = total_count + numel
-        return total_flip / (total_count + 1e-6)
+        return 1.0 - (total_flip / (total_count + 1e-6))
 
 
     @torch.no_grad()    
