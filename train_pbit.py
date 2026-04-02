@@ -104,7 +104,7 @@ class Hyperparameters:
     density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 100.0))
     noise_warmup_steps = int(os.environ.get("NOISE_WARMUP_STEPS", 2000))
 
-    res_init_scale: float = float(os.environ.get("RES_INIT_SCALE", 0.01))
+    res_init_scale: float = float(os.environ.get("RES_INIT_SCALE", 1.0))
     
     mask_emb_dim = int(os.environ.get("MASK_EMB_DIM", 8))
 
