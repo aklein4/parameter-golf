@@ -70,12 +70,12 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 3)) # 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024 * 256))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 16))
+    num_layers = int(os.environ.get("NUM_LAYERS", 12))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 1024))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -99,7 +99,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
     lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 100))
     
-    target_density = float(os.environ.get("TARGET_DENSITY", 0.20))
+    target_density = float(os.environ.get("TARGET_DENSITY", 0.35))
     minimum_density = float(os.environ.get("MINIMUM_DENSITY", 0.01))
     density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 100.0))
     noise_warmup_steps = int(os.environ.get("NOISE_WARMUP_STEPS", 2000))
