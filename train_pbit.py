@@ -75,7 +75,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -173,7 +173,7 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             if not params:
-                continue
+                continue 
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
@@ -573,12 +573,14 @@ class STEFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
+        return torch.sign(x) * torch.abs(x).clamp(1e-6, 1.0)
+
         c = cosine_step(torch.abs(x))
         cc = cosine_step(c)
 
-        y = torch.sign(x) * (c + cc) / 2
+        y = (c + cc) / 2
 
-        return y.clamp(1e-6, 1.0)
+        return torch.sign(x) * y.clamp(1e-6, 1.0)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tensor:
