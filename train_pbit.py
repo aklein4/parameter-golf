@@ -673,11 +673,11 @@ class PBitLinear(nn.Module):
         var = (0.5 - torch.abs(p - 0.5)).square().clamp_min(1e-6)
 
         # unit in -> unit out scaling
-        row_scales = 1 / ((w.square() + var * noise_scale.square()).sum(dim=-1, keepdim=True).float() + 1e-6)
+        row_scales = 1 / (0.5 * math.sqrt(self.in_features))
         matrix_scale = (
             (1.0 + self.in_scale.to(w.dtype))[None, :] *
             (1.0 + self.out_scale.to(w.dtype))[:, None] *
-            row_scales.to(w.dtype)
+            row_scales
         )
         
         w = w * matrix_scale
@@ -693,11 +693,11 @@ class PBitLinear(nn.Module):
 
         b = torch.sign(w) * torch.round(p).to(w.dtype)
 
-        row_scales = 1 / (torch.norm(w.float(), dim=1, keepdim=True) + 1e-6)
+        row_scales = 1 / (0.5 * math.sqrt(self.in_features))
         matrix_scale = (
             (1.0 + self.in_scale.to(b.dtype))[None, :] *
             (1.0 + self.out_scale.to(b.dtype))[:, None] *
-            row_scales.to(b.dtype)
+            row_scales
         )
 
         return b * matrix_scale
@@ -708,10 +708,20 @@ def clamp_weight(weight) -> None:
     weight.clamp_(-1.0 / weight.pbit_scale, 1.0 / weight.pbit_scale)
 
 
+class RoundPSTE(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x: Tensor) -> Tensor:
+        return torch.round(x).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> Tensor:
+        return grad_output
+
 def get_density(weight) -> Tensor:
 
     w = STEFunction.apply(weight * weight.pbit_scale)
-    p = w.abs()
+    p = RoundPSTE.apply(w)
 
     row_density = p.mean(dim=-1, keepdim=True)
     column_density = p.mean(dim=-2, keepdim=True)
