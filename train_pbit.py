@@ -632,7 +632,7 @@ class PBitLinear(nn.Module):
         
         if not self.training:
 
-            mean = self.get_mean_var()[0].to(x.dtype)
+            mean = self.get_mean_var(noise_scale)[0].to(x.dtype)
             b = self.sample_weight().to(x.dtype)
 
             x_mean = torch.mean(x, dim=[0,1], keepdim=True)
@@ -645,7 +645,7 @@ class PBitLinear(nn.Module):
 
             return y
 
-        mean, var = self.get_mean_var()
+        mean, var = self.get_mean_var(noise_scale)
         mean = mean.to(x.dtype) # see CastedLinear
         var = var.to(x.dtype)
 
@@ -664,7 +664,7 @@ class PBitLinear(nn.Module):
         return y
 
 
-    def get_mean_var(self) -> tuple[Tensor, Tensor]:
+    def get_mean_var(self, noise_scale) -> tuple[Tensor, Tensor]:
 
         # scale brings up to unit range
         w = STEFunction.apply(self.weight * self.scale)
@@ -673,7 +673,7 @@ class PBitLinear(nn.Module):
         var = (0.5 - torch.abs(p - 0.5)).square().clamp_min(1e-6)
 
         # unit in -> unit out scaling
-        row_scales = 1 / ((w.square() + var).sum(dim=-1, keepdim=True).float() + 1e-6)
+        row_scales = 1 / ((w.square() + var * noise_scale.square()).sum(dim=-1, keepdim=True).float() + 1e-6)
         matrix_scale = (
             (1.0 + self.in_scale.to(w.dtype))[None, :] *
             (1.0 + self.out_scale.to(w.dtype))[:, None] *
