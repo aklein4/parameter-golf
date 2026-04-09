@@ -83,7 +83,6 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    res_init_scale = float(os.environ.get("RES_INIT_SCALE", 1.0))
 
     # Optimizer hyperparameters.
     matrix_lr = float(os.environ.get("MATRIX_LR", 1e-3))
@@ -340,7 +339,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "in_scale,out_scale,out_shift,q_scales,k_scales,bias",
+        "in_scale,out_scale,out_shift,q_scales,k_scales,bias,logit_scale",
     ).split(",")
     if pattern
 )
@@ -596,7 +595,6 @@ class PBitLinear(nn.Module):
         out_features: int,
         target_density: float,
         minimum_density: float,
-        init_scale: float=1.0,
     ):
         super().__init__()
 
@@ -616,15 +614,14 @@ class PBitLinear(nn.Module):
         self.weight.pbit_scale = self.scale
         self.weight.minimum_density = minimum_density
 
-        init_target = math.sqrt(init_scale) - 1.0
         self.in_scale = nn.Parameter(
-            torch.ones(in_features) * init_target
+            torch.zeros(in_features)
         )
         self.out_shift = nn.Parameter(
             torch.zeros(out_features)
         )
         self.out_scale = nn.Parameter(
-            torch.ones(out_features) * init_target
+            torch.zeros(out_features)
         )
 
 
@@ -670,10 +667,10 @@ class PBitLinear(nn.Module):
         w = STEFunction.apply(self.weight * self.scale)
         p = w.abs()
 
-        var = (0.5 - torch.abs(p - 0.5)).square().clamp_min(1e-6)
+        var = (p * (1.0 - p)).clamp_min(1e-6)
 
         # unit in -> unit out scaling
-        row_scales = 1 / ((w.square() + var).sum(dim=-1, keepdim=True).float() + 1e-6)
+        row_scales = 1 / (torch.norm(w.float(), dim=1, keepdim=True) + 1e-6)
         matrix_scale = (
             (1.0 + self.in_scale.to(w.dtype))[None, :] *
             (1.0 + self.out_scale.to(w.dtype))[:, None] *
@@ -691,7 +688,7 @@ class PBitLinear(nn.Module):
         w = STEFunction.apply(self.weight * self.scale)
         p = w.abs()
 
-        b = torch.sign(w) * torch.round(p).to(w.dtype)
+        b = torch.sign(w) * torch.bernoulli(p).to(w.dtype)
 
         row_scales = 1 / (torch.norm(w.float(), dim=1, keepdim=True) + 1e-6)
         matrix_scale = (
@@ -803,7 +800,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        res_init_scale: float,
         target_density: float,
         minimum_density: float,
         mask_emb_dim: int,
@@ -825,7 +821,7 @@ class CausalSelfAttention(nn.Module):
         self.c_qkv = PBitLinear(dim, self.q_dim+self.k_dim+self.v_dim, target_density, minimum_density)
         self.c_gate = CastedLinear(dim, self.num_heads, bias=True)
         self.c_gate.bias_init = 2.0
-        self.proj = PBitLinear(dim, dim, target_density, minimum_density, init_scale=res_init_scale)
+        self.proj = PBitLinear(dim, dim, target_density, minimum_density)
         self.q_scales = nn.Parameter(torch.ones(1, self.num_heads, 1, self.proj_head_dim) * (math.sqrt(qk_gain_init) - 1.0))
         self.k_scales = nn.Parameter(torch.ones(1, self.num_kv_heads, 1, self.proj_head_dim) * (math.sqrt(qk_gain_init) - 1.0))
         self.rotary = Rotary(self.head_dim // 2, base=rope_base)
@@ -897,11 +893,11 @@ def sqelu(x: Tensor) -> Tensor:
 
 class MLP(nn.Module):
 
-    def __init__(self, dim: int, mlp_mult: int, target_density: float, minimum_density: float, res_init_scale: float):
+    def __init__(self, dim: int, mlp_mult: int, target_density: float, minimum_density: float):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = PBitLinear(dim, hidden, target_density, minimum_density)
-        self.proj = PBitLinear(hidden, dim, target_density, minimum_density, init_scale=res_init_scale)
+        self.proj = PBitLinear(hidden, dim, target_density, minimum_density)
 
     def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
         x = self.fc(x, noise_scale)
@@ -950,7 +946,6 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        res_init_scale: float,
         target_density: float,
         minimum_density: float,
         mask_emb_dim: int,
@@ -959,8 +954,8 @@ class Block(nn.Module):
         self.layer_index = layer_index
         self.attn_norm = RMSNorm() # matrices have in_scales for affine
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, res_init_scale, target_density, minimum_density, mask_emb_dim)
-        self.mlp = MLP(dim, mlp_mult, target_density, minimum_density, res_init_scale)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, target_density, minimum_density, mask_emb_dim)
+        self.mlp = MLP(dim, mlp_mult, target_density, minimum_density)
 
     def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         x_attn = self.attn(self.attn_norm(x), noise_scale, mask_emb_q, mask_emb_k)
@@ -1043,7 +1038,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        res_init_scale: float,
         target_density: float,
         minimum_density: float,
         density_loss_scale: float,
@@ -1061,6 +1055,7 @@ class GPT(nn.Module):
         self.density_loss_scale = density_loss_scale
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.logit_scale = nn.Parameter(torch.ones(1) * 0.01)
 
         self.blocks = nn.ModuleList(
             [
@@ -1072,7 +1067,6 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    res_init_scale,
                     target_density,
                     minimum_density,
                     mask_emb_dim,
@@ -1135,7 +1129,7 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
 
-        logits_proj = F.linear(x, self.tok_emb.weight)
+        logits_proj = F.linear(x, self.tok_emb.weight) * self.logit_scale
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
@@ -1291,7 +1285,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        res_init_scale=args.res_init_scale,
         target_density=args.target_density,
         minimum_density=args.minimum_density,
         density_loss_scale=args.density_loss_scale,
@@ -1381,7 +1374,7 @@ def main() -> None:
     def lr_mul(step: int, elapsed_ms: float) -> float:
         return (
             linear_step(step / args.lr_warmup_steps) *
-            (1.0 - linear_step(elapsed_ms / max_wallclock_ms))
+            (1.0 - cosine_step(elapsed_ms / max_wallclock_ms))
         )
         if args.warmdown_iters <= 0:
             return 1.0
@@ -1435,7 +1428,7 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0 and step > 0)
+        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -1590,3 +1583,62 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.10.12 (main, May 27 2025, 17:12:29) [GCC 11.4.0]
+Running PyTorch 2.7.0
+Thu Apr  9 00:20:54 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.148.08             Driver Version: 570.148.08     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GH200 480GB             On  |   00000000:DD:00.0 Off |                    0 |
+| N/A   46C    P0             93W /  700W |       5MiB /  97871MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+Matrix params:
+  blocks.attn___c_qkv___weight: (16, 1952, 1024)
+  blocks.attn___c_gate___weight: (16, 8, 1024)
+  blocks.attn___proj___weight: (16, 1024, 1024)
+  blocks.mlp___fc___weight: (16, 2048, 1024)
+  blocks.mlp___proj___weight: (16, 1024, 2048)
+Scalar params:
+  logit_scale: (1,)
+  blocks.attn___q_scales: (16, 1, 8, 1, 120)
+  blocks.attn___k_scales: (16, 1, 4, 1, 120)
+  blocks.attn___c_qkv___in_scale: (16, 1024)
+  blocks.attn___c_qkv___out_shift: (16, 1952)
+  blocks.attn___c_qkv___out_scale: (16, 1952)
+  blocks.attn___c_gate___bias: (16, 8)
+  blocks.attn___proj___in_scale: (16, 1024)
+  blocks.attn___proj___out_shift: (16, 1024)
+  blocks.attn___proj___out_scale: (16, 1024)
+  blocks.mlp___fc___in_scale: (16, 1024)
+  blocks.mlp___fc___out_shift: (16, 2048)
+  blocks.mlp___fc___out_scale: (16, 2048)
+  blocks.mlp___proj___in_scale: (16, 2048)
+  blocks.mlp___proj___out_shift: (16, 1024)
+  blocks.mlp___proj___out_scale: (16, 1024)
+model_params:117_345_921
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.001 matrix_lr:0.001 scalar_lr:0.032
+train_batch_tokens:262144 train_seq_len:2048 iterations:20000 warmup_steps:3 max_wallclock_seconds:4800.000
+seed:1337
