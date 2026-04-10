@@ -75,7 +75,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 16))
+    num_layers = int(os.environ.get("NUM_LAYERS", 12))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 1024))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -575,13 +575,7 @@ class STEFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
-
-        c = cosine_step(torch.abs(x))
-        cc = cosine_step(c)
-
-        y = (c + cc) / 2
-
-        return torch.sign(x) * y.clamp(1e-6, 1.0)
+        return torch.sign(x) * torch.round(x.abs()).clamp(1e-6, 1.0)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tensor:
@@ -630,47 +624,24 @@ class PBitLinear(nn.Module):
 
     def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
         
-        if not self.training:
-
-            mean = self.get_mean_var(noise_scale)[0].to(x.dtype)
-            b = self.sample_weight().to(x.dtype)
-
-            x_mean = torch.mean(x, dim=[0,1], keepdim=True)
-            x = x - x_mean
-
-            y = F.linear(x, b, bias=None)
-            out_mean = F.linear(x_mean, mean, bias=None)
-
-            y = y + out_mean + self.out_shift.to(y.dtype)
-
-            return y
-
-        mean, var = self.get_mean_var(noise_scale)
-        mean = mean.to(x.dtype) # see CastedLinear
-        var = var.to(x.dtype)
+        w, m = self.get_mean_var()
+        w = w.to(x.dtype) # see CastedLinear
+        m = m.to(x.dtype)
 
         x_mean = torch.mean(x, dim=[0,1], keepdim=True)
         x = x - x_mean
 
-        m = F.linear(x, mean, bias=None)
-        v = F.linear(x.square(), var, bias=None)
+        y = F.linear(x, w, bias=self.out_shift.to(x.dtype))
+        y_mean = F.linear(x_mean, m, bias=None)
 
-        out_mean = F.linear(x_mean, mean, bias=None)
-        m = m + out_mean + self.out_shift.to(m.dtype)
-
-        noise = noise_scale * torch.randn_like(v)
-        y = m + noise * torch.sqrt(v + 1e-6)
-
-        return y
+        return y + y_mean
 
 
-    def get_mean_var(self, noise_scale) -> tuple[Tensor, Tensor]:
+    def get_mean_var(self) -> tuple[Tensor, Tensor]:
 
         # scale brings up to unit range
-        w = STEFunction.apply(self.weight * self.scale)
-        p = w.abs()
-
-        var = (0.5 - torch.abs(p - 0.5)).square().clamp_min(1e-6)
+        m = self.weight * self.scale
+        w = STEFunction.apply(m)
 
         # unit in -> unit out scaling
         row_scales = 1 / (0.5 * math.sqrt(self.in_features))
@@ -680,27 +651,10 @@ class PBitLinear(nn.Module):
             row_scales
         )
         
+        m = m * matrix_scale
         w = w * matrix_scale
-        var = var * matrix_scale.square()
 
-        return w, var
-
-
-    def sample_weight(self) -> Tensor:
-        
-        w = STEFunction.apply(self.weight * self.scale)
-        p = w.abs()
-
-        b = torch.sign(w) * torch.round(p).to(w.dtype)
-
-        row_scales = 1 / (0.5 * math.sqrt(self.in_features))
-        matrix_scale = (
-            (1.0 + self.in_scale.to(b.dtype))[None, :] *
-            (1.0 + self.out_scale.to(b.dtype))[:, None] *
-            row_scales
-        )
-
-        return b * matrix_scale
+        return w, m
 
     
 @torch.no_grad()
@@ -712,7 +666,7 @@ class RoundPSTE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
-        return torch.round(x).to(x.dtype)
+        return torch.round(x.abs()).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tensor:
@@ -739,7 +693,8 @@ def get_density(weight) -> Tensor:
 
 def get_confidence(weight) -> Tensor:
 
-    w = STEFunction.apply(weight * weight.pbit_scale)
+    # w = STEFunction.apply(weight * weight.pbit_scale)
+    w = weight * weight.pbit_scale
     p = w.abs()
 
     flip = 0.5 - torch.abs(p - 0.5)
@@ -1149,14 +1104,6 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-
-        if self.density_loss_scale > 0.0:
-            log_target_density = math.log(2.0 * self.target_density)
-            target_density = 0.5 * torch.exp(noise_scale * log_target_density)
-
-            density = self.get_density()
-            density_loss = F.huber_loss(self.density_loss_scale * F.relu(density - target_density), torch.zeros_like(density))
-            loss = loss + density_loss - density_loss.detach()
 
         return loss
 
