@@ -75,7 +75,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 12))
+    num_layers = int(os.environ.get("NUM_LAYERS", 16))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 1024))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -83,10 +83,9 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    res_init_scale = float(os.environ.get("RES_INIT_SCALE", 1.0))
 
     # Optimizer hyperparameters.
-    matrix_lr = float(os.environ.get("MATRIX_LR", 1e-3))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 3e-3))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", matrix_lr))
     scalar_lr = float(os.environ.get("SCALAR_LR", math.sqrt(model_dim) * matrix_lr))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
@@ -575,7 +574,13 @@ class STEFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
-        return torch.sign(x) * torch.round(x.abs()).clamp(1e-6, 1.0)
+
+        c = cosine_step(torch.abs(x))
+        cc = cosine_step(c)
+
+        y = (c + cc) / 2
+
+        return torch.sign(x) * y.clamp(1e-6, 1.0)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tensor:
@@ -590,7 +595,6 @@ class PBitLinear(nn.Module):
         out_features: int,
         target_density: float,
         minimum_density: float,
-        init_scale: float=1.0,
     ):
         super().__init__()
 
@@ -610,38 +614,60 @@ class PBitLinear(nn.Module):
         self.weight.pbit_scale = self.scale
         self.weight.minimum_density = minimum_density
 
-        init_target = math.sqrt(init_scale) - 1.0
         self.in_scale = nn.Parameter(
-            torch.ones(in_features) * init_target
+            torch.zeros(in_features)
         )
         self.out_shift = nn.Parameter(
             torch.zeros(out_features)
         )
         self.out_scale = nn.Parameter(
-            torch.ones(out_features) * init_target
+            torch.zeros(out_features)
         )
 
 
     def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
         
-        w, m = self.get_mean_var()
-        w = w.to(x.dtype) # see CastedLinear
-        m = m.to(x.dtype)
+        if not self.training:
+
+            mean = self.get_mean_var()[0].to(x.dtype)
+            b = self.sample_weight().to(x.dtype)
+
+            x_mean = torch.mean(x, dim=[0,1], keepdim=True)
+            x = x - x_mean
+
+            y = F.linear(x, b, bias=None)
+            out_mean = F.linear(x_mean, mean, bias=None)
+
+            y = y + out_mean + self.out_shift.to(y.dtype)
+
+            return y
+
+        mean, var = self.get_mean_var()
+        mean = mean.to(x.dtype) # see CastedLinear
+        var = var.to(x.dtype)
 
         x_mean = torch.mean(x, dim=[0,1], keepdim=True)
         x = x - x_mean
 
-        y = F.linear(x, w, bias=self.out_shift.to(x.dtype))
-        y_mean = F.linear(x_mean, m, bias=None)
+        m = F.linear(x, mean, bias=None)
+        v = F.linear(x.square(), var, bias=None)
 
-        return y + y_mean
+        out_mean = F.linear(x_mean, mean, bias=None)
+        m = m + out_mean + self.out_shift.to(m.dtype)
+
+        noise = noise_scale * torch.randn_like(v)
+        y = m + noise * torch.sqrt(v + 1e-6)
+
+        return y
 
 
     def get_mean_var(self) -> tuple[Tensor, Tensor]:
 
         # scale brings up to unit range
-        m = self.weight * self.scale
-        w = STEFunction.apply(m)
+        w = STEFunction.apply(self.weight * self.scale)
+        p = w.abs()
+
+        var = (p * (1.0 - p)).clamp_min(1e-6)
 
         # unit in -> unit out scaling
         row_scales = 1 / (0.5 * math.sqrt(self.in_features))
@@ -651,10 +677,27 @@ class PBitLinear(nn.Module):
             row_scales
         )
         
-        m = m * matrix_scale
         w = w * matrix_scale
+        var = var * matrix_scale.square()
 
-        return w, m
+        return w, var
+
+
+    def sample_weight(self) -> Tensor:
+        
+        w = STEFunction.apply(self.weight * self.scale)
+        p = w.abs()
+
+        b = torch.sign(w) * torch.bernoulli(p).to(w.dtype)
+
+        row_scales = 1 / (torch.norm(w.float(), dim=1, keepdim=True) + 1e-6)
+        matrix_scale = (
+            (1.0 + self.in_scale.to(b.dtype))[None, :] *
+            (1.0 + self.out_scale.to(b.dtype))[:, None] *
+            row_scales.to(b.dtype)
+        )
+
+        return b * matrix_scale
 
     
 @torch.no_grad()
@@ -662,20 +705,10 @@ def clamp_weight(weight) -> None:
     weight.clamp_(-1.0 / weight.pbit_scale, 1.0 / weight.pbit_scale)
 
 
-class RoundPSTE(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, x: Tensor) -> Tensor:
-        return torch.round(x.abs()).to(x.dtype)
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tensor:
-        return grad_output
-
 def get_density(weight) -> Tensor:
 
     w = STEFunction.apply(weight * weight.pbit_scale)
-    p = RoundPSTE.apply(w)
+    p = w.abs()
 
     row_density = p.mean(dim=-1, keepdim=True)
     column_density = p.mean(dim=-2, keepdim=True)
@@ -693,8 +726,7 @@ def get_density(weight) -> Tensor:
 
 def get_confidence(weight) -> Tensor:
 
-    # w = STEFunction.apply(weight * weight.pbit_scale)
-    w = weight * weight.pbit_scale
+    w = STEFunction.apply(weight * weight.pbit_scale)
     p = w.abs()
 
     flip = 0.5 - torch.abs(p - 0.5)
@@ -768,7 +800,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        res_init_scale: float,
         target_density: float,
         minimum_density: float,
         mask_emb_dim: int,
@@ -790,9 +821,8 @@ class CausalSelfAttention(nn.Module):
         self.c_qkv = PBitLinear(dim, self.q_dim+self.k_dim+self.v_dim, target_density, minimum_density)
         self.c_gate = CastedLinear(dim, self.num_heads, bias=True)
         self.c_gate.bias_init = 2.0
-        self.proj = PBitLinear(dim, dim, target_density, minimum_density, init_scale=res_init_scale)
-        self.q_scales = nn.Parameter(torch.ones(1, self.num_heads, 1, self.proj_head_dim) * (math.sqrt(qk_gain_init) - 1.0))
-        self.k_scales = nn.Parameter(torch.ones(1, self.num_kv_heads, 1, self.proj_head_dim) * (math.sqrt(qk_gain_init) - 1.0))
+        self.proj = PBitLinear(dim, dim, target_density, minimum_density)
+        self.qk_gain = nn.Parameter(torch.ones(1, self.num_heads, 1, 1) * (qk_gain_init - 1.0))
         self.rotary = Rotary(self.head_dim // 2, base=rope_base)
 
     def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
@@ -805,8 +835,8 @@ class CausalSelfAttention(nn.Module):
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.proj_head_dim).transpose(1, 2)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
-        q = F.rms_norm(q, (q.size(-1),)) * (1.0 + self.q_scales.to(q.dtype))
-        k = F.rms_norm(k, (k.size(-1),)) * (1.0 + self.k_scales.to(k.dtype))
+        q = F.rms_norm(q, (q.size(-1),)) * (1.0 + self.qk_gain)
+        k = F.rms_norm(k, (k.size(-1),))
         
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, mask_emb_q)
@@ -862,11 +892,11 @@ def sqelu(x: Tensor) -> Tensor:
 
 class MLP(nn.Module):
 
-    def __init__(self, dim: int, mlp_mult: int, target_density: float, minimum_density: float, res_init_scale: float):
+    def __init__(self, dim: int, mlp_mult: int, target_density: float, minimum_density: float):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = PBitLinear(dim, hidden, target_density, minimum_density)
-        self.proj = PBitLinear(hidden, dim, target_density, minimum_density, init_scale=res_init_scale)
+        self.proj = PBitLinear(hidden, dim, target_density, minimum_density)
 
     def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
         x = self.fc(x, noise_scale)
@@ -915,7 +945,6 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        res_init_scale: float,
         target_density: float,
         minimum_density: float,
         mask_emb_dim: int,
@@ -924,8 +953,8 @@ class Block(nn.Module):
         self.layer_index = layer_index
         self.attn_norm = RMSNorm() # matrices have in_scales for affine
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, res_init_scale, target_density, minimum_density, mask_emb_dim)
-        self.mlp = MLP(dim, mlp_mult, target_density, minimum_density, res_init_scale)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, target_density, minimum_density, mask_emb_dim)
+        self.mlp = MLP(dim, mlp_mult, target_density, minimum_density)
 
     def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         x_attn = self.attn(self.attn_norm(x), noise_scale, mask_emb_q, mask_emb_k)
@@ -1008,7 +1037,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        res_init_scale: float,
         target_density: float,
         minimum_density: float,
         density_loss_scale: float,
@@ -1037,7 +1065,6 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    res_init_scale,
                     target_density,
                     minimum_density,
                     mask_emb_dim,
@@ -1104,6 +1131,14 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        if self.density_loss_scale > 0.0:
+            log_target_density = math.log(2.0 * self.target_density)
+            target_density = 0.5 * torch.exp(noise_scale * log_target_density)
+
+            density = self.get_density()
+            density_loss = F.huber_loss(self.density_loss_scale * F.relu(density - target_density), torch.zeros_like(density))
+            loss = loss + density_loss - density_loss.detach()
 
         return loss
 
@@ -1248,7 +1283,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        res_init_scale=args.res_init_scale,
         target_density=args.target_density,
         minimum_density=args.minimum_density,
         density_loss_scale=args.density_loss_scale,
@@ -1392,7 +1426,7 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0 and step > 0)
+        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
