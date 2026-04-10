@@ -111,6 +111,9 @@ def main():
     train_ds = datasets.Dataset.from_dict({"input_ids": train_sequences}, split="train")
     val_ds = datasets.Dataset.from_dict({"input_ids": val_sequences}, split="validation")
 
+    train_ds = train_ds.shuffle(seed=42)
+    val_ds = val_ds.shuffle(seed=42)
+
     train_ds.save_to_disk("./data/datasets/fineweb_2048_train")
     val_ds.save_to_disk("./data/datasets/fineweb_2048_val")
 
