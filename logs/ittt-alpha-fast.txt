@@ -2020,3 +2020,16 @@ step:374/20000 train_loss:2.4283 train_time:444.441s step_avg:1188.3ms early_los
 step:375/20000 train_loss:2.4301 train_time:445.635s step_avg:1188.4ms early_loss:2.384 late_loss:2.438
 step:376/20000 train_loss:2.4389 train_time:446.807s step_avg:1188.3ms early_loss:2.265 late_loss:2.239
 step:377/20000 train_loss:2.4193 train_time:447.975s step_avg:1188.3ms early_loss:2.601 late_loss:2.542
+step:378/20000 train_loss:2.4356 train_time:449.155s step_avg:1188.2ms early_loss:2.393 late_loss:2.481
+step:379/20000 train_loss:2.4442 train_time:450.355s step_avg:1188.3ms early_loss:2.427 late_loss:2.408
+step:380/20000 train_loss:2.4183 train_time:451.563s step_avg:1188.3ms early_loss:2.359 late_loss:2.314
+step:381/20000 train_loss:2.3911 train_time:452.763s step_avg:1188.4ms early_loss:2.378 late_loss:2.297
+step:382/20000 train_loss:2.3896 train_time:453.940s step_avg:1188.3ms early_loss:2.421 late_loss:2.241
+step:383/20000 train_loss:2.4675 train_time:455.126s step_avg:1188.3ms early_loss:2.570 late_loss:2.477
+step:384/20000 train_loss:2.4305 train_time:456.301s step_avg:1188.3ms early_loss:2.361 late_loss:2.415
+step:385/20000 train_loss:2.3994 train_time:457.514s step_avg:1188.3ms early_loss:2.422 late_loss:2.475
+step:386/20000 train_loss:2.4572 train_time:458.718s step_avg:1188.4ms early_loss:2.467 late_loss:2.370
+step:387/20000 train_loss:2.4078 train_time:459.923s step_avg:1188.4ms early_loss:2.424 late_loss:2.461
+step:388/20000 train_loss:2.4085 train_time:461.106s step_avg:1188.4ms early_loss:2.503 late_loss:2.448
+step:389/20000 train_loss:2.4282 train_time:462.302s step_avg:1188.4ms early_loss:2.478 late_loss:2.397
+step:390/20000 train_loss:2.3927 train_time:463.507s step_avg:1188.5ms early_loss:2.430 late_loss:2.386
