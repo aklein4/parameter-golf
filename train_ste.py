@@ -74,7 +74,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 3)) # 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024 * 256))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model shape.
@@ -86,7 +86,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))
     res_init_scale = float(os.environ.get("RES_INIT_SCALE", 1.0))
 
     # Optimizer hyperparameters.
@@ -652,6 +652,8 @@ class BitLinear(nn.Module):
         b = b.to(x.dtype) # see CastedLinear
         m = m.to(x.dtype)
 
+        return F.linear(x, b, bias=self.out_shift.to(x.dtype))
+
         x_mean = torch.mean(x, dim=[0,1], keepdim=True)
         x = x - x_mean
 
@@ -730,6 +732,7 @@ class CausalConv(nn.Module):
             padding=kernel_size-1,
             bias=False
         )
+        nn.init.zeros_(self.conv.weight)
 
 
     def forward(self, x: Tensor) -> Tensor:
@@ -759,7 +762,7 @@ class LayerConv(nn.Module):
         return (x * w).sum(dim=-1)
 
 
-class Rotary(nn.Module):
+class Rotary(nn.Module): 
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
@@ -830,9 +833,9 @@ class CausalSelfAttention(nn.Module):
         self.v_dim = self.num_kv_heads * self.head_dim
         self.c_qkv = BitLinear(dim, self.q_dim+self.k_dim+self.v_dim+self.num_heads, scale_rank)
         self.proj = BitLinear(dim, dim, scale_rank, init_scale=res_init_scale)
-        self.q_scales = nn.Parameter(torch.ones(1, self.num_heads, 1, self.proj_head_dim) * (math.sqrt(qk_gain_init) - 1.0))
-        self.k_scales = nn.Parameter(torch.ones(1, self.num_kv_heads, 1, self.proj_head_dim) * (math.sqrt(qk_gain_init) - 1.0))
+        self.qk_gain = nn.Parameter(torch.ones(1, self.num_heads, 1, 1) * (math.sqrt(qk_gain_init) - 1.0))
         self.rotary = Rotary(self.head_dim // 2, base=rope_base)
+        self.k_conv = CausalConv(self.k_dim, 4)
 
     def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -840,12 +843,14 @@ class CausalSelfAttention(nn.Module):
         qkv = self.c_qkv(x, noise_scale)
         q, k, v, g = torch.split(qkv, [self.q_dim, self.k_dim, self.v_dim, self.num_heads], dim=-1)
 
+        k = k + self.k_conv(k)
+
         q = q.reshape(bsz, seqlen, self.num_heads, self.proj_head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.proj_head_dim).transpose(1, 2)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
-        q = F.rms_norm(q, (q.size(-1),)) * (1.0 + self.q_scales.to(q.dtype))
-        k = F.rms_norm(k, (k.size(-1),)) * (1.0 + self.k_scales.to(k.dtype))
+        q = F.rms_norm(q, (q.size(-1),)) * (1.0 + self.qk_gain.to(q.dtype))
+        k = F.rms_norm(k, (k.size(-1),))
         
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, mask_emb_q)
@@ -945,9 +950,11 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         
-        x = x + self.attn(self.attn_norm(x), noise_scale, mask_emb_q, mask_emb_k)
-        
-        x = x + self.mlp(self.mlp_norm(x), noise_scale)
+        x_attn = self.attn(self.attn_norm(x), noise_scale, mask_emb_q, mask_emb_k)
+        x = ortho_residual(x_attn, x)
+
+        x_mlp = self.mlp(self.mlp_norm(x), noise_scale)
+        x = ortho_residual(x_mlp, x)
 
         return x
 
