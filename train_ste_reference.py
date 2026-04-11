@@ -33,14 +33,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 CHECKLIST
 [ ] Accurate byte estimation
 [ ] Actual bitnet compression
-[ ] Parallel residual >X<
+[ ] Parallel residual
 [ ] Unet
 [ ] Progressive quantization
 [ ] Shuffled data
 [ ] Input embeddings at layers
 [x] Causal Convolution
 [ ] Bigram hash?
-[x] No ortho residual?
+[ ] No ortho residual?
 [ ] XSA?
 -----------------------------
 """
@@ -79,11 +79,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 12))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 4))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))
@@ -100,15 +100,13 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.01))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.00))
     adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.01))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
     lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 100))
     
     quant_steps = int(os.environ.get("quant_steps", 8))
-    scale_rank = int(os.environ.get("SCALE_RANK", 24))
-
-    hyper_dim = int(os.environ.get("HYPER_DIM", 4))
+    scale_rank = int(os.environ.get("SCALE_RANK", 16))
 
     kernel_size = int(os.environ.get("KERNEL_SIZE", 8))
     mask_emb_dim = int(os.environ.get("MASK_EMB_DIM", 8))
@@ -588,8 +586,8 @@ class STEFunction(torch.autograd.Function):
         ) / (quant_steps - 1) - 1
 
         # return torch.round(
-        #     ((quant_steps-1)/2) * x
-        # ) / ((quant_steps-1)/2)?
+        #     (quant_steps/2) * x
+        # ) / (quant_steps/2)
             
 
 
@@ -924,36 +922,12 @@ class MLP(nn.Module):
 
 
 def ortho_residual(x: Tensor, residual: Tensor) -> Tensor:
+    return residual + x
 
     res_direction = F.normalize(residual, dim=-1)
     proj = (x * res_direction).sum(dim=-1, keepdim=True) * res_direction
 
-    return residual + RMSNorm()(x - proj)
-
-
-class HyperIn(nn.Module):
-
-    def __init__(self, dim: int, hyper_dim: int):
-        super().__init__()
-        self.weight = nn.Parameter(2*torch.rand(dim, hyper_dim)-1)
-        self.weight.is_2d = False
-
-    def forward(self, x: Tensor) -> Tensor:
-        return x
-        w = 1.0 + self.weight[None,None]
-        return (x * w).sum(-1)
-
-class HyperOut(nn.Module):
-
-    def __init__(self, dim: int, hyper_dim: int):
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(dim, hyper_dim))
-        self.weight.is_2d = False
-
-    def forward(self, x: Tensor) -> Tensor:
-        return x
-        w = 1.0 + self.weight[None,None]
-        return x.unsqueeze(-1) * w
+    return residual + x - proj
 
 
 class Block(nn.Module):
@@ -969,7 +943,6 @@ class Block(nn.Module):
         res_init_scale: float,
         quant_steps: int,
         scale_rank: int,
-        hyper_dim: int,
         mask_emb_dim: int,
     ):
         super().__init__()
@@ -978,29 +951,12 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, res_init_scale, quant_steps, scale_rank, mask_emb_dim)
         self.mlp = MLP(dim, mlp_mult, quant_steps, scale_rank, res_init_scale)
-        self.attn_in = HyperIn(dim, hyper_dim)
-        self.attn_out = HyperOut(dim, hyper_dim)
-        self.mlp_in = HyperIn(dim, hyper_dim)
-        self.mlp_out = HyperOut(dim, hyper_dim)
-        self.attn_x_mix = nn.Parameter(torch.zeros(dim))
-        self.attn_x0_mix = nn.Parameter(torch.zeros(dim))
-        self.mlp_x_mix = nn.Parameter(torch.zeros(dim))
-        self.mlp_x0_mix = nn.Parameter(torch.zeros(dim))
 
-    def forward(self, x: Tensor, x0: Tensor,noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
-        
-        x_attn = (
-            (1 + self.attn_x_mix) * self.attn_norm(self.attn_in(x)) +
-            self.attn_x0_mix * x0
-        )
-        x_attn = self.attn(x_attn, noise_scale, mask_emb_q, mask_emb_k)
+    def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
+        x_attn = self.attn(self.attn_norm(x), noise_scale, mask_emb_q, mask_emb_k)
         x = ortho_residual(x_attn, x)
-
-        x_mlp = (
-            (1 + self.mlp_x_mix) * self.mlp_norm(self.mlp_in(x)) +
-            self.mlp_x0_mix * x0
-        )
-        x_mlp = self.mlp(x_mlp, noise_scale)
+        
+        x_mlp = self.mlp(self.mlp_norm(x), noise_scale)
         x = ortho_residual(x_mlp, x)
 
         return x
@@ -1033,7 +989,7 @@ class StackedLayers(nn.Module):
             if p.is_bit:
                 p.bit_scale = ref.bit_scale
 
-            p.is_2d = getattr(p, "is_2d", ref.ndim == 2)
+            p.is_2d = ref.ndim == 2
 
             self.register_parameter(safe_name(key), p)
             for d in param_dicts:
@@ -1079,7 +1035,6 @@ class GPT(nn.Module):
         res_init_scale: float,
         quant_steps: int,
         scale_rank: int,
-        hyper_dim: int,
         kernel_size: int,
         mask_emb_dim: int,
     ):
@@ -1093,8 +1048,6 @@ class GPT(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.conv = CausalConv(model_dim, kernel_size)
-        self.tok_out = HyperOut(model_dim, hyper_dim)
-        self.conv_out = HyperOut(model_dim, hyper_dim)
 
         self.blocks = nn.ModuleList(
             [
@@ -1109,14 +1062,12 @@ class GPT(nn.Module):
                     res_init_scale,
                     quant_steps,
                     scale_rank,
-                    hyper_dim,
                     mask_emb_dim,
                 )
                 for i in range(num_layers)
             ]
         )
         
-        self.final_in = HyperIn(model_dim, hyper_dim)
         self.final_norm = RMSNorm()
 
         self._init_weights()
@@ -1163,16 +1114,13 @@ class GPT(nn.Module):
         mask_emb_q, mask_emb_k = self.get_mask_emb(input_ids)
         
         x = self.tok_emb(input_ids)
-        x = self.conv(x)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+        x = self.conv(x)
 
         for index in range(len(self.blocks)):
-            x = self.blocks(index, x, x0, noise_scale, mask_emb_q, mask_emb_k)
+            x = self.blocks(index, x, noise_scale, mask_emb_q, mask_emb_k)
 
-        x = self.final_norm(self.final_in(x))
-        
-        x = x.reshape(-1, x.size(-1))
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
 
         logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1326,7 +1274,6 @@ def main() -> None:
         res_init_scale=args.res_init_scale,
         quant_steps=args.quant_steps,
         scale_rank=args.scale_rank,
-        hyper_dim=args.hyper_dim,
         kernel_size=args.kernel_size,
         mask_emb_dim=args.mask_emb_dim,
     ).to(device).float()
