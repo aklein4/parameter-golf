@@ -652,8 +652,6 @@ class BitLinear(nn.Module):
         b = b.to(x.dtype) # see CastedLinear
         m = m.to(x.dtype)
 
-        return F.linear(x, b, bias=self.out_shift.to(x.dtype))
-
         x_mean = torch.mean(x, dim=[0,1], keepdim=True)
         x = x - x_mean
 
@@ -762,7 +760,7 @@ class LayerConv(nn.Module):
         return (x * w).sum(dim=-1)
 
 
-class Rotary(nn.Module): 
+class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
@@ -949,7 +947,6 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult, scale_rank, res_init_scale)
 
     def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
-        
         x_attn = self.attn(self.attn_norm(x), noise_scale, mask_emb_q, mask_emb_k)
         x = ortho_residual(x_attn, x)
 
@@ -1045,13 +1042,6 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.conv = CausalConv(model_dim, kernel_size)
 
-        self.layer_convs = nn.ModuleList(
-            [
-                LayerConv(model_dim, i+1)
-                for i in range(num_layers+1)
-            ]
-        )
-
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1119,18 +1109,9 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = x + self.conv(x)
 
-        # hiddens = x[..., None]
         for index in range(len(self.blocks)):
-
             x = self.blocks(index, x, noise_scale, mask_emb_q, mask_emb_k)
-
-            # h = self.layer_convs[index](hiddens)
-            # h = self.blocks(index, h, noise_scale, mask_emb_q, mask_emb_k)
-            # hiddens = torch.cat([hiddens, h[..., None]], dim=-1)
         
-        # x = self.layer_convs[-1](hiddens)
-        # x = hiddens.sum(dim=-1)
-
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
 
