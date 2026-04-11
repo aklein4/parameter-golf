@@ -64,7 +64,7 @@ def main() -> None:
     args = parser.parse_args()
 
     plt.figure(figsize=(10, 6))
-    for run in args.runs:
+    for index, run in enumerate(args.runs):
         path = find_log(run)
         steps, losses, times = read_losses(path)
         if args.max_steps is not None:
@@ -73,7 +73,7 @@ def main() -> None:
             losses = losses[mask]
             times = times[mask]
         x = times / (1000 * 60) if  args.time else steps
-        (line,) = plt.plot(x, losses, alpha=0.25, linewidth=1)
+        (line,) = plt.plot(x, losses, alpha=0.25, linewidth=1, color=("black" if index==len(args.runs)-1 else None))
         plt.plot(x, rolling_mean(losses, args.window), color=line.get_color(), linewidth=2, label=run)
 
     plt.xlabel("step" if not args.time else "time (minutes)")
