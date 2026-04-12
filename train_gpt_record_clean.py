@@ -36,7 +36,7 @@ from flash_attn_interface import flash_attn_func as flash_attn_3_func
 # Hyperparameters
 # ----------------------------------------
 
-class Hyperparameters():
+class Hyperparameters:
     # Experiment settings
     data_dir = os.environ.get('DATA_DIR', './data/')
     seed = int(os.environ.get('SEED', 1337))
@@ -71,7 +71,6 @@ class Hyperparameters():
     logit_softcap = float(os.environ.get('LOGIT_SOFTCAP', 30.0))
     rope_base = float(os.environ.get('ROPE_BASE', 10000.0))
     rope_dims = int(os.environ.get('ROPE_DIMS', 16))
-    rope_train_seq_len = int(os.environ.get('ROPE_TRAIN_SEQ_LEN', 2048))
     ln_scale = bool(int(os.environ.get('LN_SCALE', '1')))
     qk_gain_init = float(os.environ.get('QK_GAIN_INIT', 4.0))
 
@@ -80,9 +79,9 @@ class Hyperparameters():
     loop_start = int(os.environ.get('LOOP_START', 4))
     loop_end = int(os.environ.get('LOOP_END', 5))
     enable_looping_at = float(os.environ.get('ENABLE_LOOPING_AT', 0.5))
-    # NEW: Progressive recurrence curriculum
+    # Progressive recurrence curriculum
     loop_phase2_at = float(os.environ.get('LOOP_PHASE2_AT', 0.0))  # 0 = disabled (use binary switch)
-    # NEW: Untie repeated MLPs
+    # Untie repeated MLPs
     untie_loop_mlps = bool(int(os.environ.get('UNTIE_LOOP_MLPS', '0')))
     # Parallel residuals: MLP reads pre-attention input (GPT-J style) from this layer onward
     parallel_residual_start: int = int(os.environ.get('PARALLEL_RESIDUAL_START', '-1'))  # -1 = off
@@ -105,7 +104,6 @@ class Hyperparameters():
     adam_eps = float(os.environ.get('ADAM_EPS', 1e-8))
     grad_clip_norm = float(os.environ.get('GRAD_CLIP_NORM', 0.3))
     eval_stride = int(os.environ.get('EVAL_STRIDE', 64))
-    muon_beta2 = float(os.environ.get('MUON_BETA2', 0.95))
     adam_wd = float(os.environ.get('ADAM_WD', 0.02))
     muon_wd = float(os.environ.get('MUON_WD', 0.085))
     embed_wd = float(os.environ.get('EMBED_WD', 0.085))
@@ -119,15 +117,15 @@ class Hyperparameters():
     embed_bits = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
-    # NEW: Hessian-aware clipping
+    # Hessian-aware clipping
     hessian_clip_lambda = float(os.environ.get('HESSIAN_CLIP_LAMBDA', 0.0))  # 0 = disabled
     # Per-group clip multipliers (multiply matrix_clip_sigmas per block group)
     # Informed by 3-seed Hessian analysis: early=317M, loop=128M, mid=50M, late=11M trace
-    clip_mult_early = float(os.environ.get('CLIP_MULT_EARLY', '1.0'))   # blocks 0-2
-    clip_mult_loop  = float(os.environ.get('CLIP_MULT_LOOP',  '1.0'))   # blocks 4-5
-    clip_mult_mid   = float(os.environ.get('CLIP_MULT_MID',   '1.0'))   # blocks 3,6-7
-    clip_mult_late  = float(os.environ.get('CLIP_MULT_LATE',  '1.0'))   # blocks 8-10
-    # NEW: Per-layer quant for looped layers
+    clip_mult_early = float(os.environ.get('CLIP_MULT_EARLY', '1.0'))  # blocks 0-2
+    clip_mult_loop = float(os.environ.get('CLIP_MULT_LOOP', '1.0'))  # blocks 4-5
+    clip_mult_mid = float(os.environ.get('CLIP_MULT_MID', '1.0'))  # blocks 3,6-7
+    clip_mult_late = float(os.environ.get('CLIP_MULT_LATE', '1.0'))  # blocks 8-10
+    # Per-layer quantization for looped layers
     loop_layer_bits = int(os.environ.get('LOOP_LAYER_BITS', 0))  # 0 = use matrix_bits
     loop_layer_clip_sigmas = float(os.environ.get('LOOP_LAYER_CLIP_SIGMAS', 0))  # 0 = use matrix_clip_sigmas
 
@@ -520,7 +518,12 @@ class GPT(nn.Module):
             head_dim = h.model_dim // h.num_heads
             for block in self.blocks:
                 block.attn.rope_dims = h.rope_dims
-                block.attn.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
+                block.attn.rotary = Rotary(
+                    head_dim,
+                    base=h.rope_base,
+                    train_seq_len=h.train_seq_len,
+                    rope_dims=h.rope_dims,
+                )
         self.final_norm = RMSNorm()
         self.lm_head = None if h.tie_embeddings else CastedLinear(h.embedding_dim, h.vocab_size, bias=False)
         if self.lm_head is not None:
@@ -618,7 +621,7 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        for name, module in self.named_modules():
+        for _name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
                     nn.init.zeros_(module.weight)
@@ -634,7 +637,14 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
-        dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
+        dec_iter = (
+            self.decoder_indices
+            if self.looping_active
+            else range(
+                self.num_encoder_layers,
+                self.num_encoder_layers + self.num_decoder_layers,
+            )
+        )
         pass_count: dict[int, int] = {}
         for i in enc_iter:
             pc = pass_count.get(i, 0)
@@ -892,7 +902,7 @@ def collect_hessians(
     hooks = []
 
     def make_hook(name: str):
-        def hook_fn(module, inp, out):
+        def hook_fn(_module, inp, _out):
             x = inp[0].detach().float()
             if x.ndim == 3:
                 x = x.reshape(-1, x.shape[-1])
@@ -912,7 +922,7 @@ def collect_hessians(
     if model.tie_embeddings:
         hook_module = model.head_proj if model.head_proj is not None else model.final_norm
         def make_output_hook(name: str):
-            def hook_fn(module, inp, out):
+            def hook_fn(_module, inp, _out):
                 x = out.detach().float()
                 if x.ndim == 3:
                     x = x.reshape(-1, x.shape[-1])
@@ -1512,7 +1522,7 @@ def eval_val_ttt(
             epochs = h.ttt_epochs
 
         base_model.train()
-        for _epoch in range(epochs):
+        for _ in range(epochs):
             for bi in range(0, len(my_windows), batch_seqs):
                 batch_ws = my_windows[bi:bi + batch_seqs]
                 bsz = len(batch_ws)
@@ -1603,9 +1613,15 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         log(f"loop_layer_quant: bits={h.loop_layer_bits} clip={h.loop_layer_clip_sigmas}")
     if h.loop_phase2_at > 0:
         log(f"progressive_recurrence: phase1={h.enable_looping_at} phase2={h.loop_phase2_at}")
-    has_group_mults = any(getattr(h, f'clip_mult_{g}') != 1.0 for g in ('early', 'loop', 'mid', 'late'))
+    has_group_mults = any(
+        getattr(h, f'clip_mult_{group}') != 1.0
+        for group in ('early', 'loop', 'mid', 'late')
+    )
     if has_group_mults:
-        log(f"per_group_clip: early={h.clip_mult_early} loop={h.clip_mult_loop} mid={h.clip_mult_mid} late={h.clip_mult_late}")
+        log(
+            f"per_group_clip: early={h.clip_mult_early} loop={h.clip_mult_loop} "
+            f"mid={h.clip_mult_mid} late={h.clip_mult_late}"
+        )
 
     optimizers = Optimizers(h, base_model)
     train_loader = ShuffledSequenceLoader(h, device)
@@ -1737,7 +1753,11 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
                 if not base_model.looping_active and frac >= h.enable_looping_at:
                     base_model.activate_looping(1)
                     log(f"layer_loop:phase1 step:{step} frac:{frac:.3f}")
-                elif base_model.looping_active and base_model.encoder_indices is base_model.phase1_enc and frac >= h.loop_phase2_at:
+                elif (
+                    base_model.looping_active
+                    and base_model.encoder_indices is base_model.phase1_enc
+                    and frac >= h.loop_phase2_at
+                ):
                     base_model.activate_looping(2)
                     log(f"layer_loop:phase2 step:{step} frac:{frac:.3f}")
             else:
@@ -1838,7 +1858,12 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    from torch.backends.cuda import (
+        enable_cudnn_sdp,
+        enable_flash_sdp,
+        enable_math_sdp,
+        enable_mem_efficient_sdp,
+    )
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
@@ -1859,8 +1884,13 @@ def main():
         log(f"Running Python {sys.version}", console=False)
         log(f"Running PyTorch {torch.__version__}", console=False)
         log(
-            subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, check=False).stdout,
+            subprocess.run(
+                ["nvidia-smi"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            ).stdout,
             console=False,
         )
         log("=" * 100, console=False)
@@ -1873,4 +1903,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

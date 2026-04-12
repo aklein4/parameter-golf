@@ -55,15 +55,7 @@ CHECKLIST
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
-
-def _env(key: str, kind: type, default):
-    if kind is bool:
-        return bool(_env(key, int, default))
-    return kind(os.environ.get(key, default))
-
-
 class Hyperparameters:
-
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -75,7 +67,7 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000)) # 1000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", -1)) # 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 1)) # 200))
 
     # Training length.
@@ -83,7 +75,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 3)) # 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024 * 256))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model shape.
@@ -123,7 +115,7 @@ class Hyperparameters:
     quant_full_step = int(os.environ.get("QUANT_FULL_STEP", 8000))
 
     kernel_size = int(os.environ.get("KERNEL_SIZE", 8))
-    mask_emb_dim = int(os.environ.get("MASK_EMB_DIM", 4))
+    mask_emb_dim = int(os.environ.get("MASK_EMB_DIM", 8))
 
     enable_quant = float(int(os.environ.get("ENABLE_QUANT", 1)))
 
@@ -912,7 +904,7 @@ class CausalSelfAttention(nn.Module):
             dim=-1
         )
 
-        # k = k + self.k_conv(k)
+        k = k + self.k_conv(k)
 
         q = q.reshape(bsz, seqlen, self.num_heads, self.emb_head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.emb_head_dim).transpose(1, 2)
@@ -934,16 +926,15 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         # y = flash_attn_func(q, k, v, causal=True, window_size=(512,0))
-        # y = self._xsa_efficient(y, v)
+        y = self._xsa_efficient(y, v)
 
         
-        # y_conv = self.v_conv(
-        #     v_f
-        # ).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim//2)
+        y_conv = self.v_conv(
+            v_f
+        ).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim//2)
         
-        # g = torch.sigmoid(g + 2.0)
-        # y_conv = y_conv * g[..., None]
-        y_conv = v_f[..., :self.conv_dim]
+        g = torch.sigmoid(g + 2.0)
+        y_conv = y_conv * g[..., None]
         
         y_conv = y_conv.reshape(bsz, seqlen, self.conv_dim)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -1001,12 +992,49 @@ class MLP(nn.Module):
 
 
 def ortho_residual(x: Tensor, residual: Tensor) -> Tensor:
-    return x + residual
 
     res_direction = F.normalize(residual, dim=-1)
     proj = (x * res_direction).sum(dim=-1, keepdim=True) * res_direction
 
     return residual + RMSNorm()(x - proj)
+
+
+class HyperIn(nn.Module):
+
+    def __init__(self, dim: int, hyper_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.ones(dim, hyper_dim) * (2*torch.rand(1,hyper_dim)-1)
+        )
+        self.weight.is_2d = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        w = 1.0 + self.weight[None,None]
+        return (x * w.to(x.dtype)).sum(-1)
+
+class HyperInMulti(nn.Module):
+
+    def __init__(self, dim: int, hyper_dim: int, count: int):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.ones(count, dim, hyper_dim) * (2*torch.rand(count,1,hyper_dim)-1)
+        )
+        self.weight.is_2d = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        w = 1.0 + self.weight[:,None,None]
+        return (x[None] * w.to(x.dtype)).sum(-1)
+
+class HyperOut(nn.Module):
+
+    def __init__(self, dim: int, hyper_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(dim, hyper_dim))
+        self.weight.is_2d = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        w = 1.0 + self.weight[None,None]
+        return x.unsqueeze(-1) * w.to(x.dtype)
 
 
 class Block(nn.Module):
@@ -1031,28 +1059,22 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, res_init_scale, quant_steps, scale_rank, mask_emb_dim)
         self.mlp = MLP(dim, mlp_mult, quant_steps, scale_rank, res_init_scale)
-        self.attn_x_mix = nn.Parameter(torch.zeros(dim))
-        self.attn_x0_mix = nn.Parameter(torch.zeros(dim))
-        self.mlp_x_mix = nn.Parameter(torch.zeros(dim))
-        self.mlp_x0_mix = nn.Parameter(torch.zeros(dim))
+        self.hyper_in = HyperInMulti(dim, hyper_dim, 2)
+        self.hyper_out_attn = HyperOut(dim, hyper_dim)
+        self.hyper_out_mlp = HyperOut(dim, hyper_dim)
+        self.x_attn_scale = nn.Parameter(torch.zeros(dim))
 
-    def forward(self, x: Tensor, x0: Tensor,quant_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
+    def forward(self, x_hyper: Tensor, quant_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         
-        x_attn = self.attn_norm(
-            (1 + self.attn_x_mix) * x +
-            self.attn_x0_mix * x0
-        )
+        x_multi = self.hyper_in(x_hyper)
+
+        x_attn = self.attn_norm(x_multi[0])
         x_attn = self.attn(x_attn, quant_scale, mask_emb_q, mask_emb_k)
-        x = ortho_residual(x_attn, x)
 
-        x_mlp = self.mlp_norm(
-            (1 + self.mlp_x_mix) * x +
-            self.mlp_x0_mix * x0
-        )
+        x_mlp = self.mlp_norm(x_multi[1] + (1.0 + self.x_attn_scale) * x_attn)
         x_mlp = self.mlp(x_mlp, quant_scale)
-        x = ortho_residual(x_mlp, x)
-
-        return x
+    
+        return x_hyper + self.hyper_out_attn(x_attn) + self.hyper_out_mlp(x_mlp)
 
 
 def safe_name(name: str) -> str:
@@ -1113,6 +1135,12 @@ class StackedLayers(nn.Module):
             )
 
 
+def maybe_bfloat(x):
+    if torch.is_floating_point(x):
+        return x.bfloat16()
+    return x
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -1142,6 +1170,8 @@ class GPT(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.conv = CausalConv(model_dim, kernel_size, zero_init=True)
+        self.hyper_tok = HyperOut(model_dim, hyper_dim)
+        self.hyper_conv = HyperOut(model_dim, hyper_dim)
 
         self.blocks = nn.ModuleList(
             [
@@ -1209,13 +1239,14 @@ class GPT(nn.Module):
         mask_emb_q, mask_emb_k = self.get_mask_emb(input_ids)
         
         x = self.tok_emb(input_ids)
-        x = x + self.conv(x)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+        x_conv = self.conv(x)
+        x = self.hyper_tok(x) + self.hyper_conv(x_conv)
 
         for index in range(len(self.blocks)):
-            x = self.blocks(index, x, x0, quant_scale, mask_emb_q, mask_emb_k)
+            x = self.blocks(index, x, quant_scale, mask_emb_q, mask_emb_k)
 
+        x = x.sum(dim=-1)
         x = self.final_norm(x)
         
         x = x.reshape(-1, x.size(-1))
@@ -1494,7 +1525,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y, quant_scale)
+                    warmup_loss = model.forward(x, y, quant_scale)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()

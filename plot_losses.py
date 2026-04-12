@@ -85,8 +85,8 @@ def main() -> None:
             losses = losses[mask]
             times = times[mask]
         x = times / (1000 * 60) if  args.time else steps
-        (line,) = plt.plot(x, losses, alpha=0.10, linewidth=1, color=("black" if index==len(args.runs)-1 else f"C{index}"))
-        plt.plot(x, rolling_mean(losses, args.window), color=line.get_color(), linewidth=2, label=run)
+        (line,) = plt.plot(x, losses, alpha=0.10, linewidth=0.5, color=("black" if index==len(args.runs)-1 else f"C{index}"))
+        plt.plot(x, rolling_mean(losses, args.window), color=line.get_color(), linewidth=1, label=run)
 
     plt.xlabel("step" if not args.time else "time (minutes)")
     plt.ylabel("train loss")

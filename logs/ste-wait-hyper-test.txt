@@ -55,15 +55,7 @@ CHECKLIST
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
-
-def _env(key: str, kind: type, default):
-    if kind is bool:
-        return bool(_env(key, int, default))
-    return kind(os.environ.get(key, default))
-
-
 class Hyperparameters:
-
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -75,7 +67,7 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000)) # 1000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", -1)) # 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 1)) # 200))
 
     # Training length.
@@ -83,7 +75,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 3)) # 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1024 * 256))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model shape.
@@ -123,7 +115,7 @@ class Hyperparameters:
     quant_full_step = int(os.environ.get("QUANT_FULL_STEP", 8000))
 
     kernel_size = int(os.environ.get("KERNEL_SIZE", 8))
-    mask_emb_dim = int(os.environ.get("MASK_EMB_DIM", 4))
+    mask_emb_dim = int(os.environ.get("MASK_EMB_DIM", 8))
 
     enable_quant = float(int(os.environ.get("ENABLE_QUANT", 1)))
 
@@ -912,7 +904,7 @@ class CausalSelfAttention(nn.Module):
             dim=-1
         )
 
-        # k = k + self.k_conv(k)
+        k = k + self.k_conv(k)
 
         q = q.reshape(bsz, seqlen, self.num_heads, self.emb_head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.emb_head_dim).transpose(1, 2)
@@ -934,16 +926,15 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         # y = flash_attn_func(q, k, v, causal=True, window_size=(512,0))
-        # y = self._xsa_efficient(y, v)
+        y = self._xsa_efficient(y, v)
 
         
-        # y_conv = self.v_conv(
-        #     v_f
-        # ).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim//2)
+        y_conv = self.v_conv(
+            v_f
+        ).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim//2)
         
-        # g = torch.sigmoid(g + 2.0)
-        # y_conv = y_conv * g[..., None]
-        y_conv = v_f[..., :self.conv_dim]
+        g = torch.sigmoid(g + 2.0)
+        y_conv = y_conv * g[..., None]
         
         y_conv = y_conv.reshape(bsz, seqlen, self.conv_dim)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -1001,12 +992,51 @@ class MLP(nn.Module):
 
 
 def ortho_residual(x: Tensor, residual: Tensor) -> Tensor:
-    return x + residual
 
     res_direction = F.normalize(residual, dim=-1)
     proj = (x * res_direction).sum(dim=-1, keepdim=True) * res_direction
 
     return residual + RMSNorm()(x - proj)
+
+
+class HyperIn(nn.Module):
+
+    def __init__(self, dim: int, hyper_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.ones(dim, hyper_dim) * (2*torch.rand(1,hyper_dim)-1)
+        )
+        self.weight.is_2d = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        w = 1.0 + self.weight[None,None]
+        return (x * w).sum(-1)
+
+class HyperInMulti(nn.Module):
+
+    def __init__(self, dim: int, hyper_dim: int, count: int):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.ones(count, dim, hyper_dim) * (2*torch.rand(count,1,hyper_dim)-1)
+        )
+        self.weight.is_2d = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        w = 1.0 + self.weight[:,None,None]
+        return (x[None] * w).sum(-1)
+
+class HyperOut(nn.Module):
+
+    def __init__(self, dim: int, hyper_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(dim, hyper_dim))
+        self.weight.is_2d = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        w = 1.0 + self.weight[None,None]
+        out = x.unsqueeze(-1) * w
+        print(out.dtype)
+        return out
 
 
 class Block(nn.Module):
@@ -1031,28 +1061,22 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, res_init_scale, quant_steps, scale_rank, mask_emb_dim)
         self.mlp = MLP(dim, mlp_mult, quant_steps, scale_rank, res_init_scale)
-        self.attn_x_mix = nn.Parameter(torch.zeros(dim))
-        self.attn_x0_mix = nn.Parameter(torch.zeros(dim))
-        self.mlp_x_mix = nn.Parameter(torch.zeros(dim))
-        self.mlp_x0_mix = nn.Parameter(torch.zeros(dim))
+        self.hyper_in = HyperInMulti(dim, hyper_dim, 2)
+        self.hyper_out_attn = HyperOut(dim, hyper_dim)
+        self.hyper_out_mlp = HyperOut(dim, hyper_dim)
+        self.x_attn_scale = nn.Parameter(torch.zeros(dim))
 
-    def forward(self, x: Tensor, x0: Tensor,quant_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
+    def forward(self, x_hyper: Tensor, quant_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         
-        x_attn = self.attn_norm(
-            (1 + self.attn_x_mix) * x +
-            self.attn_x0_mix * x0
-        )
+        x_multi = self.hyper_in(x_hyper)
+
+        x_attn = self.attn_norm(x_multi[0])
         x_attn = self.attn(x_attn, quant_scale, mask_emb_q, mask_emb_k)
-        x = ortho_residual(x_attn, x)
 
-        x_mlp = self.mlp_norm(
-            (1 + self.mlp_x_mix) * x +
-            self.mlp_x0_mix * x0
-        )
+        x_mlp = self.mlp_norm(x_multi[1] + (1.0 + self.x_attn_scale) * x_attn)
         x_mlp = self.mlp(x_mlp, quant_scale)
-        x = ortho_residual(x_mlp, x)
-
-        return x
+    
+        return x_hyper + self.hyper_out_attn(x_attn) + self.hyper_out_mlp(x_mlp)
 
 
 def safe_name(name: str) -> str:
@@ -1101,16 +1125,24 @@ class StackedLayers(nn.Module):
         return len(self.layers)    
 
     def forward(self, index, *args, **kwargs) -> Tensor:
+        # functional_call can temporarily swap registered parameters with plain tensors,
+        # so direct attribute lookup is more robust here than get_parameter/get_buffer.
         return torch.func.functional_call(
                 self.layers[index],
                 [
-                    {n: self.get_parameter(safe_name(n))[index] for n in self.param_names},
-                    {n: self.get_buffer(safe_name(n))[index] for n in self.buffer_names},
+                    {n: getattr(self, safe_name(n))[index] for n in self.param_names},
+                    {n: getattr(self, safe_name(n))[index] for n in self.buffer_names},
                 ],
                 args,
                 kwargs,
                 strict=True,
             )
+
+
+def maybe_bfloat(x):
+    if torch.is_floating_point(x):
+        return x.bfloat16()
+    return x
 
 
 class GPT(nn.Module):
@@ -1142,6 +1174,8 @@ class GPT(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.conv = CausalConv(model_dim, kernel_size, zero_init=True)
+        self.hyper_tok = HyperOut(model_dim, hyper_dim)
+        self.hyper_conv = HyperOut(model_dim, hyper_dim)
 
         self.blocks = nn.ModuleList(
             [
@@ -1209,13 +1243,14 @@ class GPT(nn.Module):
         mask_emb_q, mask_emb_k = self.get_mask_emb(input_ids)
         
         x = self.tok_emb(input_ids)
-        x = x + self.conv(x)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
+        x_conv = self.conv(x)
+        x = self.hyper_tok(x) + self.hyper_conv(x_conv)
 
         for index in range(len(self.blocks)):
-            x = self.blocks(index, x, x0, quant_scale, mask_emb_q, mask_emb_k)
+            x = self.blocks(index, x, quant_scale, mask_emb_q, mask_emb_k)
 
+        x = x.sum(dim=-1)
         x = self.final_norm(x)
         
         x = x.reshape(-1, x.size(-1))
@@ -1227,6 +1262,19 @@ class GPT(nn.Module):
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
         return loss
+
+    
+    def bfloat_forward(self, model, *args, **kwargs):
+        return torch.func.functional_call(
+            model,
+            [
+                {n: maybe_bfloat(p) for n,p in self.named_parameters()},
+                {n: maybe_bfloat(b) for n,b in self.named_buffers()},
+            ],
+            args,
+            kwargs,
+            strict=True,
+        )
 
 
     def get_density(self) -> Tensor:
@@ -1493,8 +1541,8 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y, quant_scale)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
+                    warmup_loss = model.bfloat_forward(compiled_model, x, y, quant_scale)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1564,8 +1612,8 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, quant_scale)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
+                loss = model.bfloat_forward(compiled_model, x, y, quant_scale)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1680,3 +1728,75 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.10.12 (main, May 27 2025, 17:12:29) [GCC 11.4.0]
+Running PyTorch 2.7.0
+Sun Apr 12 22:13:42 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.148.08             Driver Version: 570.148.08     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GH200 480GB             On  |   00000000:DD:00.0 Off |                    0 |
+| N/A   35C    P0             87W /  700W |      13MiB /  97871MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+Matrix params:
+  blocks.attn___c_qkv___weight: (12, 932, 512)
+  blocks.attn___c_qkv___in_scale: (12, 16, 512)
+  blocks.attn___c_qkv___out_scale: (12, 932, 16)
+  blocks.attn___proj___weight: (12, 512, 640)
+  blocks.attn___proj___in_scale: (12, 16, 640)
+  blocks.attn___proj___out_scale: (12, 512, 16)
+  blocks.mlp___fc___weight: (12, 2048, 512)
+  blocks.mlp___fc___in_scale: (12, 16, 512)
+  blocks.mlp___fc___out_scale: (12, 2048, 16)
+  blocks.mlp___proj___weight: (12, 512, 2048)
+  blocks.mlp___proj___in_scale: (12, 16, 2048)
+  blocks.mlp___proj___out_scale: (12, 512, 16)
+Scalar params:
+  conv.conv.weight: (512, 1, 8)
+  hyper_tok.weight: (512, 4)
+  hyper_conv.weight: (512, 4)
+  blocks.x_attn_scale: (12, 512)
+  blocks.attn___qk_gain: (12, 1, 8, 1, 1)
+  blocks.attn___c_qkv___out_shift: (12, 932)
+  blocks.attn___proj___out_shift: (12, 512)
+  blocks.attn___k_conv___conv___weight: (12, 224, 1, 4)
+  blocks.attn___v_conv___conv___weight: (12, 128, 64, 4)
+  blocks.mlp___fc___out_shift: (12, 2048)
+  blocks.mlp___proj___out_shift: (12, 512)
+  blocks.hyper_in___weight: (12, 2, 512, 4)
+  blocks.hyper_out_attn___weight: (12, 512, 4)
+  blocks.hyper_out_mlp___weight: (12, 512, 4)
+model_params:37_394_704
+model_bytes:15_629_584.0
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.001 matrix_lr:0.001 scalar_lr:0.022627416997969524
+train_batch_tokens:262144 train_seq_len:2048 iterations:20000 warmup_steps:3 max_wallclock_seconds:4800.000
+seed:1337
+warmup_step:1/3
+warmup_step:2/3
+warmup_step:3/3
+step:1/20000 train_loss:7.4494 train_time:1649ms step_avg:1649.1ms density:0.500 confidence:0.750 quant:None
+step:2/20000 train_loss:7.4476 train_time:3269ms step_avg:1634.6ms density:0.500 confidence:0.750 quant:None
+step:3/20000 train_loss:7.4412 train_time:4905ms step_avg:1635.1ms density:0.500 confidence:0.750 quant:None
+step:4/20000 train_loss:7.4169 train_time:6541ms step_avg:1635.2ms density:0.500 confidence:0.750 quant:None
