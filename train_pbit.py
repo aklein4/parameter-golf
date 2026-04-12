@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+# from flash_attn import flash_attn_func
 
 """
 -----------------------------
@@ -75,17 +76,17 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 16))
+    num_layers = int(os.environ.get("NUM_LAYERS", 12))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 1024))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 2.0))
 
     # Optimizer hyperparameters.
-    matrix_lr = float(os.environ.get("MATRIX_LR", 3e-3))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 1e-3))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", matrix_lr))
     scalar_lr = float(os.environ.get("SCALAR_LR", math.sqrt(model_dim) * matrix_lr))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
@@ -99,15 +100,20 @@ class Hyperparameters:
     adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.01))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
     lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 100))
-    
+
+    scale_rank = int(os.environ.get("SCALE_RANK", 16))
+
     target_density = float(os.environ.get("TARGET_DENSITY", 0.20))
     minimum_density = float(os.environ.get("MINIMUM_DENSITY", 0.01))
-    density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 100.0))
-    noise_warmup_steps = int(os.environ.get("NOISE_WARMUP_STEPS", 2000))
+    density_loss_scale = float(os.environ.get("DENSITY_LOSS_SCALE", 0.0)) # 100.0))
+    
+    noise_start_step = int(os.environ.get("NOISE_START_STEP", 2000))
+    noise_full_step = int(os.environ.get("NOISE_FULL_STEP", 4000))
 
+    kernel_size = int(os.environ.get("KERNEL_SIZE", 8))
     mask_emb_dim = int(os.environ.get("MASK_EMB_DIM", 8))
 
-    enable_noise = float(int(os.environ.get("ENABLE_NOISE", 1)))
+    enable_noise = bool(int(os.environ.get("ENABLE_NOISE", 1)))
 
 # -----------------------------
 # UTILITIES
@@ -296,7 +302,6 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    noise_scale = torch.ones((), device=device)
     with torch.inference_mode():
         for batch_seq_start in tqdm(range(seq_start, seq_end, local_batch_seqs), desc="val"):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
@@ -306,7 +311,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y, noise_scale).detach()
+                batch_loss = model(x, y, None).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -339,7 +344,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "in_scale,out_scale,out_shift,q_scales,k_scales,bias",
+        "out_shift,q_scales,k_scales,conv,bias",
     ).split(",")
     if pattern
 )
@@ -570,10 +575,12 @@ class RMSNorm(nn.Module):
             out = out / math.sqrt(1 + self.layer_index)
         return out
 
+
 class STEFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
+        return torch.sign(x) * torch.abs(x).clamp(1e-6, 1.0)
 
         c = cosine_step(torch.abs(x))
         cc = cosine_step(c)
@@ -585,6 +592,30 @@ class STEFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tensor:
         return grad_output
+    
+
+class STEELU(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x: Tensor) -> Tensor:
+        return F.elu(x) + 1.0
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> Tensor:
+        return grad_output
+
+
+class MatrixScale(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x: Tensor, scale: Tensor) -> Tensor:
+        ctx.save_for_backward(x)
+        return x * scale
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, Tensor]:
+        x, = ctx.saved_tensors
+        return grad_output, grad_output * x
 
 
 class PBitLinear(nn.Module):
@@ -593,6 +624,7 @@ class PBitLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
+        scale_rank: int,
         target_density: float,
         minimum_density: float,
     ):
@@ -600,6 +632,7 @@ class PBitLinear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
+        self.scale_rank = scale_rank
 
         self.target_density = target_density
         self.minimum_density = minimum_density
@@ -615,17 +648,19 @@ class PBitLinear(nn.Module):
         self.weight.minimum_density = minimum_density
 
         self.in_scale = nn.Parameter(
-            torch.zeros(in_features)
+            torch.randn(self.scale_rank, in_features) * 0.1
+            / self.scale
+        )
+        self.out_scale = nn.Parameter(
+            torch.randn(out_features, self.scale_rank) * 0.1
+            / self.scale
         )
         self.out_shift = nn.Parameter(
             torch.zeros(out_features)
         )
-        self.out_scale = nn.Parameter(
-            torch.zeros(out_features)
-        )
 
 
-    def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
+    def forward(self, x: Tensor, noise_scale: Tensor|None) -> Tensor:
         
         if not self.training:
 
@@ -635,10 +670,10 @@ class PBitLinear(nn.Module):
             x_mean = torch.mean(x, dim=[0,1], keepdim=True)
             x = x - x_mean
 
-            y = F.linear(x, b, bias=None)
+            y = F.linear(x, b, bias=self.out_shift.to(x.dtype))
             out_mean = F.linear(x_mean, mean, bias=None)
 
-            y = y + out_mean + self.out_shift.to(y.dtype)
+            y = y + out_mean
 
             return y
 
@@ -646,16 +681,19 @@ class PBitLinear(nn.Module):
         mean = mean.to(x.dtype) # see CastedLinear
         var = var.to(x.dtype)
 
+        if noise_scale is None:
+            return F.linear(x, mean, bias=self.out_shift.to(x.dtype))
+
         x_mean = torch.mean(x, dim=[0,1], keepdim=True)
         x = x - x_mean
 
-        m = F.linear(x, mean, bias=None)
-        v = F.linear(x.square(), var, bias=None)
-
+        m = F.linear(x, mean, bias=self.out_shift.to(x.dtype))
         out_mean = F.linear(x_mean, mean, bias=None)
-        m = m + out_mean + self.out_shift.to(m.dtype)
+        m = m + out_mean
 
+        v = F.linear(x.square(), var, bias=None)
         noise = noise_scale * torch.randn_like(v)
+
         y = m + noise * torch.sqrt(v + 1e-6)
 
         return y
@@ -664,38 +702,33 @@ class PBitLinear(nn.Module):
     def get_mean_var(self) -> tuple[Tensor, Tensor]:
 
         # scale brings up to unit range
-        w = STEFunction.apply(self.weight * self.scale)
-        p = w.abs()
+        mean = STEFunction.apply(self.weight * self.scale)
+        p = mean.abs()
 
         var = (p * (1.0 - p)).clamp_min(1e-6)
 
-        # unit in -> unit out scaling
-        row_scales = 1 / (0.5 * math.sqrt(self.in_features))
-        matrix_scale = (
-            (1.0 + self.in_scale.to(w.dtype))[None, :] *
-            (1.0 + self.out_scale.to(w.dtype))[:, None] *
-            row_scales
-        )
+        # scale with LoRA
+        matrix_scale = 2.0 * (
+            STEELU.apply(self.out_scale * self.scale) @ STEELU.apply(self.in_scale * self.scale)
+        ) / (self.scale * self.scale_rank)
         
-        w = w * matrix_scale
+        mean = mean * matrix_scale
         var = var * matrix_scale.square()
 
-        return w, var
+        return mean, var
 
 
     def sample_weight(self) -> Tensor:
         
-        w = STEFunction.apply(self.weight * self.scale)
-        p = w.abs()
+        mean = STEFunction.apply(self.weight * self.scale)
+        p = mean.abs()
 
-        b = torch.sign(w) * torch.bernoulli(p).to(w.dtype)
+        b = torch.sign(mean) * torch.bernoulli(p).to(mean.dtype)
 
-        row_scales = 1 / (torch.norm(w.float(), dim=1, keepdim=True) + 1e-6)
-        matrix_scale = (
-            (1.0 + self.in_scale.to(b.dtype))[None, :] *
-            (1.0 + self.out_scale.to(b.dtype))[:, None] *
-            row_scales.to(b.dtype)
-        )
+        # scale with LoRA
+        matrix_scale = 2.0 * (
+            STEELU.apply(self.out_scale * self.scale) @ STEELU.apply(self.in_scale * self.scale)
+        ) / (self.scale * self.scale_rank)
 
         return b * matrix_scale
 
@@ -707,8 +740,8 @@ def clamp_weight(weight) -> None:
 
 def get_density(weight) -> Tensor:
 
-    w = STEFunction.apply(weight * weight.pbit_scale)
-    p = w.abs()
+    mean = STEFunction.apply(weight * weight.pbit_scale)
+    p = mean.abs()
 
     row_density = p.mean(dim=-1, keepdim=True)
     column_density = p.mean(dim=-2, keepdim=True)
@@ -747,6 +780,51 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+class CausalConv(nn.Module):
+
+    def __init__(self, dim: int, kernel_size: int):
+        super().__init__()
+
+        self.kernel_size = kernel_size
+
+        self.conv = nn.Conv1d(
+            dim, dim,
+            groups=dim,
+            kernel_size=kernel_size,
+            padding=kernel_size-1,
+            bias=False
+        )
+        nn.init.zeros_(self.conv.weight)
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        c = x.transpose(1, 2)
+        c = self.conv(c)[..., :-(self.kernel_size-1)]
+        c = c.transpose(1, 2)
+        return x + c
+
+
+class LayerConv(nn.Module):
+
+    def __init__(self, dim: int, layer: int):
+        super().__init__()
+        
+        self.dim = dim
+        self.layer = layer
+
+        self.weight = nn.Parameter(torch.zeros(layer, dim))
+
+
+    def forward(self, x) -> Tensor:
+        assert x.shape[-1] == self.layer
+
+        w = torch.softmax(
+            self.weight.view(1, 1, self.dim, self.layer), dim=-1
+        )
+
+        return (x * w).sum(dim=-1)
 
 
 class Rotary(nn.Module):
@@ -800,6 +878,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        scale_rank: int,
         target_density: float,
         minimum_density: float,
         mask_emb_dim: int,
@@ -818,24 +897,25 @@ class CausalSelfAttention(nn.Module):
         self.q_dim = self.num_heads * self.proj_head_dim
         self.k_dim = self.num_kv_heads * self.proj_head_dim
         self.v_dim = self.num_kv_heads * self.head_dim
-        self.c_qkv = PBitLinear(dim, self.q_dim+self.k_dim+self.v_dim, target_density, minimum_density)
-        self.c_gate = CastedLinear(dim, self.num_heads, bias=True)
-        self.c_gate.bias_init = 2.0
-        self.proj = PBitLinear(dim, dim, target_density, minimum_density)
+        self.c_qkv = PBitLinear(dim, self.q_dim+self.k_dim+self.v_dim+self.num_heads, scale_rank, target_density, minimum_density)
+        self.proj = PBitLinear(dim, dim, scale_rank, target_density, minimum_density)
         self.qk_gain = nn.Parameter(torch.ones(1, self.num_heads, 1, 1) * (qk_gain_init - 1.0))
         self.rotary = Rotary(self.head_dim // 2, base=rope_base)
+        self.k_conv = CausalConv(self.k_dim, 4)
 
-    def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
+    def forward(self, x: Tensor, noise_scale: Tensor|None, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         
         qkv = self.c_qkv(x, noise_scale)
-        q, k, v = torch.split(qkv, [self.q_dim, self.k_dim, self.v_dim], dim=-1)
+        q, k, v, g = torch.split(qkv, [self.q_dim, self.k_dim, self.v_dim, self.num_heads], dim=-1)
+
+        k = self.k_conv(k)
 
         q = q.reshape(bsz, seqlen, self.num_heads, self.proj_head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.proj_head_dim).transpose(1, 2)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
-        q = F.rms_norm(q, (q.size(-1),)) * (1.0 + self.qk_gain)
+        q = F.rms_norm(q, (q.size(-1),)) * STEELU.apply((1.0 + self.qk_gain.to(q.dtype)))
         k = F.rms_norm(k, (k.size(-1),))
         
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -850,8 +930,9 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # y = flash_attn_func(q, k, v, causal=True, window_size=(512,0))
 
-        g = torch.sigmoid(self.c_gate(x))
+        g = torch.sigmoid(g + 2.0)
         y = y * g.transpose(1, 2)[..., None]
 
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -892,44 +973,22 @@ def sqelu(x: Tensor) -> Tensor:
 
 class MLP(nn.Module):
 
-    def __init__(self, dim: int, mlp_mult: int, target_density: float, minimum_density: float):
+    def __init__(self, dim: int, mlp_mult: int, scale_rank: int, target_density: float, minimum_density: float):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = PBitLinear(dim, hidden, target_density, minimum_density)
-        self.proj = PBitLinear(hidden, dim, target_density, minimum_density)
+        self.fc = PBitLinear(dim, hidden, scale_rank, target_density, minimum_density)
+        self.proj = PBitLinear(hidden, dim, scale_rank, target_density, minimum_density)
 
-    def forward(self, x: Tensor, noise_scale: Tensor) -> Tensor:
+    def forward(self, x: Tensor, noise_scale: Tensor|None) -> Tensor:
         x = self.fc(x, noise_scale)
         x = sqelu(x)
         # x = F.leaky_relu(x, negative_slope=0.5).square()
         return self.proj(x, noise_scale)
 
 
-class CausalConv(nn.Module):
-
-    def __init__(self, dim: int, kernel_size: int):
-        super().__init__()
-
-        self.kernel_size = kernel_size
-
-        self.conv = nn.Conv1d(
-            dim, dim,
-            groups=dim,
-            kernel_size=kernel_size,
-            padding=kernel_size,
-            bias=False
-        )
-
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = x.transpose(1, 2)
-        x = self.conv(x)[..., :-(self.kernel_size+1)]
-        return x.transpose(1, 2)
-
-
 def ortho_residual(x: Tensor, residual: Tensor) -> Tensor:
-    res_direction = F.normalize(residual, dim=-1)
 
+    res_direction = F.normalize(residual, dim=-1)
     proj = (x * res_direction).sum(dim=-1, keepdim=True) * res_direction
 
     return residual + x - proj
@@ -945,6 +1004,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        scale_rank: int,
         target_density: float,
         minimum_density: float,
         mask_emb_dim: int,
@@ -953,10 +1013,10 @@ class Block(nn.Module):
         self.layer_index = layer_index
         self.attn_norm = RMSNorm() # matrices have in_scales for affine
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, target_density, minimum_density, mask_emb_dim)
-        self.mlp = MLP(dim, mlp_mult, target_density, minimum_density)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, scale_rank, target_density, minimum_density, mask_emb_dim)
+        self.mlp = MLP(dim, mlp_mult, scale_rank, target_density, minimum_density)
 
-    def forward(self, x: Tensor, noise_scale: Tensor, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
+    def forward(self, x: Tensor, noise_scale: Tensor|None, mask_emb_q: Tensor, mask_emb_k: Tensor) -> Tensor:
         x_attn = self.attn(self.attn_norm(x), noise_scale, mask_emb_q, mask_emb_k)
         x = ortho_residual(x_attn, x)
 
@@ -994,7 +1054,7 @@ class StackedLayers(nn.Module):
                 p.pbit_scale = ref.pbit_scale
                 p.minimum_density = ref.minimum_density
 
-            p.is_2d = ref.ndim == 2
+            p.is_2d = getattr(p, "is_2d", ref.ndim == 2)
 
             self.register_parameter(safe_name(key), p)
             for d in param_dicts:
@@ -1037,9 +1097,11 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        scale_rank: int,
         target_density: float,
         minimum_density: float,
         density_loss_scale: float,
+        kernel_size: int,
         mask_emb_dim: int,
     ):
         super().__init__()
@@ -1054,6 +1116,7 @@ class GPT(nn.Module):
         self.density_loss_scale = density_loss_scale
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.conv = CausalConv(model_dim, kernel_size)
 
         self.blocks = nn.ModuleList(
             [
@@ -1065,6 +1128,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    scale_rank,
                     target_density,
                     minimum_density,
                     mask_emb_dim,
@@ -1115,16 +1179,19 @@ class GPT(nn.Module):
         return mask_emb_q, mask_emb_k
 
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, noise_scale: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, noise_scale: Tensor|None) -> Tensor:
         mask_emb_q, mask_emb_k = self.get_mask_emb(input_ids)
         
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        x = self.conv(x)
 
         for index in range(len(self.blocks)):
             x = self.blocks(index, x, noise_scale, mask_emb_q, mask_emb_k)
         
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+        
+        x = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
 
         logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1132,7 +1199,7 @@ class GPT(nn.Module):
         
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
 
-        if self.density_loss_scale > 0.0:
+        if self.density_loss_scale > 0.0 and noise_scale is not None:
             log_target_density = math.log(2.0 * self.target_density)
             target_density = 0.5 * torch.exp(noise_scale * log_target_density)
 
@@ -1283,9 +1350,11 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        scale_rank=args.scale_rank,
         target_density=args.target_density,
         minimum_density=args.minimum_density,
         density_loss_scale=args.density_loss_scale,
+        kernel_size=args.kernel_size,
         mask_emb_dim=args.mask_emb_dim,
     ).to(device).float()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, disable=(not args.compile))
@@ -1342,7 +1411,15 @@ def main() -> None:
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
     n_params = sum(p.numel() for p in base_model.parameters() if not getattr(p, "ignore", False))
+    n_bytes = 0
+    for p in base_model.parameters():
+        if not getattr(p, "ignore", False):
+            if getattr(p, "is_pbit", False):
+                n_bytes += p.numel() * 1.585 / 8
+            else:
+                n_bytes += p.numel()
     log0(f"model_params:{n_params:_}")
+    log0(f"model_bytes:{n_bytes:_}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1390,7 +1467,6 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
-        noise_scale = torch.ones((), device=device)
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1398,7 +1474,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y, noise_scale)
+                    warmup_loss = model(x, y, None)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1426,7 +1502,7 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0 and step > 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -1461,7 +1537,9 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
-        noise_scale = args.enable_noise * cosine_step(torch.ones((), device=device) * step / args.noise_warmup_steps)
+        noise_scale = None
+        if args.enable_noise and step >= args.noise_start_step:
+            noise_scale = cosine_step(torch.ones((), device=device) * (step - args.noise_start_step) / (args.noise_full_step - args.noise_start_step))
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1499,7 +1577,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.1f}ms "
                 f"density:{base_model.get_density().item():.3f} "
-                f"confidence:{base_model.get_confidence().item():.3f} "
+                f"confidence:{base_model.get_confidence().item():.3f} " +
+                (f"noise_scale:{noise_scale:.3f}" if noise_scale is not None else "noise:None")
             )
 
         # Needed to sync whether we've reached the wallclock cap.
