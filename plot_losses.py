@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parent
 
 # example: step:8046/20000 train_loss:2.1260 train_time:2669404ms step_avg:331.77ms
 STEP_RE = re.compile(r"step:(\d+)/\d+.*train_loss:([0-9]*\.?[0-9]+)")
-TIME_RE = re.compile(r"train_loss:[0-9]*\.?[0-9]+ train_time:([0-9]*\.?[0-9]+)ms")
+RECORD_STEP_RE = re.compile(r"(\d+)/\d+.* train_loss: ([0-9]*\.?[0-9]+) train_time:")
+TIME_RE = re.compile(r"train_loss:[0-9]*\.?[0-9]+ train_time:")
 # example: final_int8_zlib_roundtrip val_loss:1.9835 val_bpb:1.1747
 BPB_RE = re.compile(r"roundtrip val_loss:([0-9]*\.?[0-9]+) val_bpb:([0-9]*\.?[0-9]+)")
 
@@ -30,20 +31,24 @@ def find_log(run: str) -> Path:
     return matches[0]
 
 
-def read_losses(run:str, path: Path) -> tuple[np.ndarray, np.ndarray]:
+def read_losses(run:str, path: Path, args) -> tuple[np.ndarray, np.ndarray]:
     steps = []
     losses = []
     times = []
     val_bpb = None
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        match = STEP_RE.search(line)
+        if args.record:
+            match = RECORD_STEP_RE.search(line)
+        else:
+            match = STEP_RE.search(line)
         if match:
             steps.append(int(match.group(1)))
             losses.append(float(match.group(2)))
             try:
                 times.append(float(TIME_RE.search(line).group(1)))
             except:
-                raise RuntimeError(f"failed to parse train_time from line: {line!r}")
+                times.append(0)
+                # raise RuntimeError(f"failed to parse train_time from line: {line!r}")
         try:
             bpb_match = BPB_RE.search(line)
             if bpb_match:
@@ -73,12 +78,13 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--ylim", nargs="+", type=float)
     parser.add_argument("--time", action="store_true")
+    parser.add_argument("--record", action="store_true")
     args = parser.parse_args()
 
     plt.figure(figsize=(10, 6))
     for index, run in enumerate(args.runs):
         path = find_log(run)
-        steps, losses, times = read_losses(run, path)
+        steps, losses, times = read_losses(run, path, args)
         if args.max_steps is not None:
             mask = steps <= args.max_steps
             steps = steps[mask]

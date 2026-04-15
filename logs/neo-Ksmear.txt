@@ -1053,6 +1053,16 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, mask_emb: Tensor) -> T
         dim=-1
     )
 
+
+class SigmoidSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        return torch.sigmoid(input)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -1087,10 +1097,12 @@ class CausalSelfAttention(nn.Module):
             self.qkv_dim + self.num_kv_heads,
             quant_steps, scale_rank
         )
-        self.proj = BitLinear(dim, dim, quant_steps, scale_rank, init_scale=res_init_scale)
+        self.use_v_conv = _env("V_CONV", bool, False)
+        self.proj = BitLinear(dim+self.conv_dim if self.use_v_conv else dim, dim, quant_steps, scale_rank, init_scale=res_init_scale)
         self.qk_gain = nn.Parameter(torch.ones(1, self.num_heads, 1, 1) * (qk_gain_init - 1.0))
         self.rotary = Rotary(self.head_dim // 2, base=rope_base)
         self.k_conv = CausalConv(self.k_dim, 4, zero_init=True)
+        self.k_gate = nn.Parameter(torch.zeros(self.k_dim))
         self.v_conv = CausalConv(self.v_dim, 4, out_dim=self.conv_dim, inclusive=False, groups=self.num_kv_heads)
         
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
@@ -1113,7 +1125,10 @@ class CausalSelfAttention(nn.Module):
             dim=-1
         )
 
-        # k = k + self.k_conv(k)
+        if _env("K_CONV", bool, False):
+            k_prev = torch.cat([torch.zeros_like(k[:, :1]), k[:, :-1]], dim=1)
+            k_g = SigmoidSTE.apply(self.k_gate + 3.0)
+            k = k_g * k + (1 - k_g) * k_prev
 
         q = q.reshape(bsz, seqlen, self.num_heads, self.emb_head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.emb_head_dim).transpose(1, 2)
@@ -1135,16 +1150,19 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         # y = flash_attn_func(q, k, v, causal=True, window_size=(512,0))
-        # y = self._xsa_efficient(y, v)
+        
+        if _env("XSA", bool, False):
+            y = self._xsa_efficient(y, v)
+        
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-
-        return self.proj(y, quant_scale)
+        if not self.use_v_conv:
+            return self.proj(y, quant_scale)
 
         y_conv = self.v_conv(
             v_f
         ).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim//2)
         
-        g = torch.sigmoid(g + 2.0)
+        g = torch.sigmoid(g)
         y_conv = y_conv * g[..., None]
         y_conv = y_conv.reshape(bsz, seqlen, self.conv_dim)
         
@@ -1201,7 +1219,9 @@ class MLP(nn.Module):
 
 
 def ortho_residual(x: Tensor, residual: Tensor) -> Tensor:
-    return residual + x
+    
+    if not _env("ORTHO_RESIDUAL", bool, False):
+        return residual + x
 
     res_direction = F.normalize(residual, dim=-1)
     proj = (x * res_direction).sum(dim=-1, keepdim=True) * res_direction
@@ -1741,3 +1761,121 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Hyperparameters:
+  adam_eps: 1e-08
+  adam_weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  compile: True
+  data_path: ./data/datasets/fineweb10B_sp1024
+  distributed: False
+  enable_quant: 1.0
+  eval_stride: 128
+  grad_accum_steps: 8
+  grad_clip_norm: 1.0
+  hyper_dim: 4
+  is_main_process: True
+  iterations: 20000
+  kernel_size: 8
+  local_rank: 0
+  logfile: logs/neo-Ksmear.txt
+  logit_softcap: 30.0
+  lr_warmup_steps: 100
+  mask_emb_dim: 8
+  matrix_lr: 0.001
+  max_wallclock_seconds: 4800.0
+  mlp_mult: 4
+  model_dim: 512
+  model_path: final_model.pt
+  muon_backend_steps: 5
+  muon_momentum: 0.95
+  muon_momentum_warmup_start: 0.85
+  muon_momentum_warmup_steps: 100
+  muon_weight_decay: 0.0
+  num_heads: 8
+  num_kv_heads: 4
+  num_layers: 12
+  qk_gain_init: 4.0
+  quant_full_step: 8000
+  quant_start_step: 6000
+  quant_steps: 8
+  quantized_model_path: final_model.int6.ptz
+  rank: 0
+  res_init_scale: 1.0
+  rope_base: 10000.0
+  run_id: neo-Ksmear
+  scalar_lr: 0.022627416997969524
+  scale_rank: 16
+  seed: 1337
+  tied_embed_lr: 0.001
+  tokenizer_path: ./data/tokenizers/fineweb_1024_bpe.model
+  train_batch_tokens: 262144
+  train_files: ./data/datasets/fineweb10B_sp1024/fineweb_train_*.bin
+  train_log_every: 1
+  train_seq_len: 2048
+  val_batch_size: 524288
+  val_files: ./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin
+  val_loss_every: -1
+  vocab_size: 1024
+  warmdown_iters: 1200
+  warmup_steps: 3
+  world_size: 1
+====================================================================================================
+Running Python 3.10.12 (main, May 27 2025, 17:12:29) [GCC 11.4.0]
+Running PyTorch 2.11.0+cu128
+Tue Apr 14 04:43:10 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.148.08             Driver Version: 570.148.08     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GH200 480GB             On  |   00000000:DD:00.0 Off |                    0 |
+| N/A   40C    P0            141W /  700W |   17652MiB /  97871MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A         1714310      C   python                                17064MiB |
+|    0   N/A  N/A         1831605      C   python                                  546MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+train_shards: 80
+val_tokens: 62_021_632
+model params:36_502_416
+model bytes:15_228_816
+Matrix params:
+  blocks.attn___c_qkv___weight: (12, 932, 512)
+  blocks.attn___c_qkv___in_scale: (12, 16, 512)
+  blocks.attn___c_qkv___out_scale: (12, 932, 16)
+  blocks.attn___proj___weight: (12, 512, 512)
+  blocks.attn___proj___in_scale: (12, 16, 512)
+  blocks.attn___proj___out_scale: (12, 512, 16)
+  blocks.mlp___fc___weight: (12, 2048, 512)
+  blocks.mlp___fc___in_scale: (12, 16, 512)
+  blocks.mlp___fc___out_scale: (12, 2048, 16)
+  blocks.mlp___proj___weight: (12, 512, 2048)
+  blocks.mlp___proj___in_scale: (12, 16, 2048)
+  blocks.mlp___proj___out_scale: (12, 512, 16)
+Scalar params:
+  conv.conv.weight: (512, 1, 8)
+  blocks.attn_x_mix: (12, 512)
+  blocks.attn_x0_mix: (12, 512)
+  blocks.mlp_x_mix: (12, 512)
+  blocks.mlp_x0_mix: (12, 512)
+  blocks.attn___qk_gain: (12, 1, 8, 1, 1)
+  blocks.attn___k_gate: (12, 224)
+  blocks.attn___c_qkv___out_shift: (12, 932)
+  blocks.attn___proj___out_shift: (12, 512)
+  blocks.attn___k_conv___conv___weight: (12, 224, 1, 4)
+  blocks.attn___v_conv___conv___weight: (12, 128, 64, 4)
+  blocks.mlp___fc___out_shift: (12, 2048)
+  blocks.mlp___proj___out_shift: (12, 512)

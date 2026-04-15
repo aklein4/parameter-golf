@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import Tensor, nn
 
-# from flash_attn_interface import flash_attn_func as flash_attn_3_func
+from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
 # ----------------------------------------
 # Hyperparameters
@@ -386,30 +386,22 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0, mask_emb: Tensor | None = None) -> Tensor:
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
     if rope_dims > 0 and rope_dims < x.size(-1):
         x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
         half = rope_dims // 2
         x1, x2 = x_rope[..., :half], x_rope[..., half:]
         x_rope = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-        t = (x_rope, x_pass)
-    
-    else:
-        half = x.size(-1) // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        t = (x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos)
-
-    if mask_emb is not None:
-        t = t + (mask_emb,)
-
-    return torch.cat(t, dim=-1)
+        return torch.cat((x_rope, x_pass), dim=-1)
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  rope_base: float, qk_gain_init: float, train_seq_len: int):
         super().__init__()
-        self.mask_emb_dim = 4
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
@@ -417,12 +409,11 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        self.emb_head_dim = self.head_dim - self.mask_emb_dim
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, self.num_heads * self.emb_head_dim, bias=False)
-        self.c_k = CastedLinear(dim, self.num_kv_heads * self.emb_head_dim, bias=False)
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
@@ -430,7 +421,6 @@ class CausalSelfAttention(nn.Module):
         self.rope_dims = 0
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=train_seq_len)
         self.use_xsa = False
-        self.k_conv_scale = nn.Parameter(torch.zeros(self.num_kv_heads * self.emb_head_dim))
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         B, T, H, D = y.shape
@@ -441,64 +431,22 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def forward(self, x: Tensor, mask_emb: tuple[Tensor, Tensor]) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.emb_head_dim)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.emb_head_dim)
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        
-        if bool(int(os.environ.get("K_CONV", "0"))):
-            c = self.k_conv_scale.to(k.dtype)
-            k_prev = torch.cat([torch.zeros_like(k[:, :1]), k[:, :-1]], dim=1)
-            k = (1 + c[0]) * k + c[1] * k_prev
-        
-        q = F.rms_norm(q, (q.size(-1),)) * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, self.rope_dims, mask_emb[0])
-        k = apply_rotary_emb(k, cos, sin, self.rope_dims, mask_emb[1])
-        # y = flash_attn_3_func(q, k, v, causal=True)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads!=self.num_heads)
-        ).transpose(1, 2).contiguous()
+        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
-
-
-class SQiLUFunction(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, x: Tensor) -> Tensor:
-        ctx.save_for_backward(x)
-
-        neg = x.clamp_max(0.0)
-        pos = x.clamp_min(0.0)
-
-        left = F.silu(neg)
-        right = (pos.square() + 0.5*pos)
-
-        return left + right
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tensor:
-        x, = ctx.saved_tensors
-
-        sig = torch.sigmoid(x)
-
-        left_grad = sig + x * sig * (1.0 - sig)
-        right_grad = 2.0 * x + 0.5
-
-        j = torch.where(x < 0.0, left_grad, right_grad)
-
-        return grad_output * j
-
-def sqilu(x: Tensor) -> Tensor:
-    return SQiLUFunction.apply(x)
 
 
 class MLP(nn.Module):
@@ -510,14 +458,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.fc(x)
-
-        if bool(int(os.environ.get("SQILU", "0"))):
-            x = sqilu(x)
-        else:
-            x = F.leaky_relu(x, negative_slope=0.5).square()
-
-        return self.proj(x)
+        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 
 class Block(nn.Module):
@@ -536,10 +477,10 @@ class Block(nn.Module):
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False  # set by GPT.__init__ if PARALLEL_RESIDUAL_START
 
-    def forward(self, x: Tensor, x0: Tensor, mask_emb) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, mask_emb)
+        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
         if self.parallel:
             # GPT-J style: MLP reads pre-attention input, both added in parallel
             mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor)
@@ -551,40 +492,6 @@ class Block(nn.Module):
             x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(
                 self.mlp_norm(x_out) * self.ln_scale_factor)
         return x_out
-
-
-class MaskEmbedding(nn.Module):
-
-    def __init__(self, num_heads, num_kv_heads):
-        super().__init__()
-
-        self.n = 4
-        self.scale = 8.0
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-
-        s = torch.arange(self.n*self.n)
-        s_1 = s // self.n
-        s_2 = s % self.n
-
-        s_1 = 2 * math.pi * s_1.float() / self.n
-        s_2 = 2 * math.pi * s_2.float() / self.n
-
-        emb = self.scale * torch.stack([torch.sin(s_1), torch.cos(s_1), torch.sin(s_2), torch.cos(s_2)], dim=-1)
-        emb = torch.round(emb).float()
-
-        self.register_buffer("emb_weight", emb, persistent=False)
-
-    def forward(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
-        
-        seq_index = ((input_ids == 1).long().cumsum(-1)).clamp(max=self.n*self.n - 1)
-
-        emb = F.embedding(seq_index, self.emb_weight)
-
-        emb_q = emb.unsqueeze(-2).repeat(1, 1, self.num_heads, 1)
-        emb_k = emb.unsqueeze(-2).repeat(1, 1, self.num_kv_heads, 1)
-
-        return emb_q, emb_k
 
 
 class GPT(nn.Module):
@@ -678,10 +585,6 @@ class GPT(nn.Module):
                     override[f"{layer_idx}_p{pass_num}"] = MLP(h.model_dim, h.mlp_mult)
             self.override_mlps = nn.ModuleDict(override)
 
-        self.mask_embedding = MaskEmbedding(
-            h.num_heads, h.num_kv_heads
-        )
-
         self._init_weights()
 
     def activate_looping(self, phase: int = 2):
@@ -697,11 +600,11 @@ class GPT(nn.Module):
             self.decoder_indices = self.phase2_dec
             self.looping_active = True
 
-    def _block_forward_with_mlp(self, block: 'Block', x: Tensor, x0: Tensor, mlp: nn.Module, mask_emb) -> Tensor:
+    def _block_forward_with_mlp(self, block: 'Block', x: Tensor, x0: Tensor, mlp: nn.Module) -> Tensor:
         """Run a block using shared attention but an override MLP."""
         mix = block.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = block.attn(block.attn_norm(x_in) * block.ln_scale_factor, mask_emb)
+        attn_out = block.attn(block.attn_norm(x_in) * block.ln_scale_factor)
         if block.parallel:
             mlp_out = mlp(block.mlp_norm(x_in) * block.ln_scale_factor)
             x_out = x_in + block.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out \
@@ -724,8 +627,6 @@ class GPT(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        mask_emb = self.mask_embedding(input_ids)
-        
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -738,9 +639,9 @@ class GPT(nn.Module):
         for i in enc_iter:
             pc = pass_count.get(i, 0)
             if pc > 0 and self.override_mlps is not None:
-                x = self._block_forward_with_mlp(self.blocks[i], x, x0, self.override_mlps[f"{i}_p{pc}"], mask_emb)
+                x = self._block_forward_with_mlp(self.blocks[i], x, x0, self.override_mlps[f"{i}_p{pc}"])
             else:
-                x = self.blocks[i](x, x0, mask_emb)
+                x = self.blocks[i](x, x0)
             pass_count[i] = pc + 1
             skips.append(x)
         for skip_idx, i in enumerate(dec_iter):
@@ -753,9 +654,9 @@ class GPT(nn.Module):
                     x = x + scaled_skip
             pc = pass_count.get(i, 0)
             if pc > 0 and self.override_mlps is not None:
-                x = self._block_forward_with_mlp(self.blocks[i], x, x0, self.override_mlps[f"{i}_p{pc}"], mask_emb)
+                x = self._block_forward_with_mlp(self.blocks[i], x, x0, self.override_mlps[f"{i}_p{pc}"])
             else:
-                x = self.blocks[i](x, x0, mask_emb)
+                x = self.blocks[i](x, x0)
             pass_count[i] = pc + 1
         x = self.final_norm(x)
         if self.head_proj is not None:
@@ -884,7 +785,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,k_conv_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates",
     ).split(",")
     if pattern
 )
@@ -1972,4 +1873,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

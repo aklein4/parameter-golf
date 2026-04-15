@@ -19,6 +19,7 @@ import uuid
 import zlib
 from pathlib import Path
 from tqdm import tqdm
+import brotli
 
 import numpy as np
 import sentencepiece as spm
@@ -95,7 +96,7 @@ class Hyperparameters:
     vocab_size = _env("VOCAB_SIZE", int, 1024)
     num_layers = _env("NUM_LAYERS", int, 12)
     num_kv_heads = _env("NUM_KV_HEADS", int, 4)
-    model_dim = _env("MODEL_DIM", int, 512)
+    model_dim = _env("MODEL_DIM", int, 768)
     num_heads = _env("NUM_HEADS", int, 8)
     mlp_mult = _env("MLP_MULT", int, 4)
     rope_base = _env("ROPE_BASE", float, 10000.0)
@@ -114,16 +115,12 @@ class Hyperparameters:
     beta1 = _env("BETA1", float, 0.9)
     beta2 = _env("BETA2", float, 0.95)
     adam_eps = _env("ADAM_EPS", float, 1e-8)
-    muon_weight_decay = _env("MUON_WEIGHT_DECAY", float, 0.00)
+    muon_weight_decay = _env("MUON_WEIGHT_DECAY", float, 0.1)
     adam_weight_decay = _env("ADAM_WEIGHT_DECAY", float, 0.01)
     grad_clip_norm = _env("GRAD_CLIP_NORM", float, 1.0)
     lr_warmup_steps = _env("LR_WARMUP_STEPS", int, 100)
     
     quant_steps = _env("quant_steps", int, 8)
-    scale_rank = _env("SCALE_RANK", int, 16)
-
-    hyper_dim = _env("HYPER_DIM", int, 4)
-
     quant_start_step = _env("QUANT_START_STEP", int, 6000)
     quant_full_step = _env("QUANT_FULL_STEP", int, 8000)
 
@@ -640,7 +637,7 @@ def eval_val_sliding(
 # Quantization
 # ----------------------------------------
 
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
+KEEP_FLOAT_FP_NAME_PATTERNS = tuple(
     pattern
     for pattern in _env(
         "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
@@ -688,7 +685,28 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(base_model: nn.Module):
+
+def quantize_model(base_model: nn.Module, h: Hyperparameters):
+
+    data = {}
+
+    for name, p in base_model.named_parameters():
+        if getattr(p, "ignore", False):
+            continue
+
+        if getattr(p, "is_quant", False):
+            data[name] = quantize_parameter(p, h.quant_steps)
+
+        else:
+            data[name] = p.bfloat16()
+
+    log("Quantized model parameters:")
+    for k, v in data.items():
+        log(f"    {k}: {v.dtype} {tuple(v.shape)}")
+
+    return data
+
+
     state_dict: dict[str, Tensor] = base_model.state_dict()
 
     # Single supported clean-script export format:
@@ -802,14 +820,14 @@ class QuantFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor, quant_steps: int, quant_scale: Tensor|None) -> Tensor:
-        x = torch.clamp(x, -1.0+1e-2, 1.0-1e-2)
-
+    
         if quant_scale is None:
             return x
 
         # TODO: this only works with even quant_steps
+        x_c = torch.clamp(x, -1.0+1e-2, 1.0-1e-2)
         q = (
-            torch.round(quant_steps * x / 2 + 0.5) - 0.5
+            torch.round(quant_steps * x_c / 2 + 0.5) - 0.5
         ) / (quant_steps / 2)
 
         return quant_scale * q + (1 - quant_scale) * x
@@ -823,131 +841,79 @@ class QuantFunction(torch.autograd.Function):
         # ) / ((quant_steps-1)/2)?
             
 
-
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> Tensor:
         return grad_output, None, None
 
 
-class STEELU(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, x: Tensor) -> Tensor:
-        return F.elu(x) + 1.0
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tensor:
-        return grad_output
-
-
-class MatrixScale(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, x: Tensor, scale: Tensor) -> Tensor:
-        ctx.save_for_backward(x)
-        return x * scale
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, Tensor]:
-        x, = ctx.saved_tensors
-        return grad_output, grad_output * x
-
-
-class BitLinear(nn.Module):
+class QuantLinear(nn.Linear):
 
     def __init__(
         self,
         in_features: int,
         out_features: int,
         quant_steps: int,
-        scale_rank: int,
-        init_scale: float=1.0,
+        bias=True,
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(in_features, out_features, bias, **kwargs)
 
-        self.in_features = in_features
-        self.out_features = out_features
+        self.weight.is_quant = True
         self.quant_steps = quant_steps
-        self.scale_rank = scale_rank
-
-        self.scale = math.sqrt(in_features)
-
-        self.weight = nn.Parameter(
-            (2.0 * torch.rand(out_features, in_features) - 1.0) # in [-1, 1]
-            / self.scale # parameter scale
-        )
-        self.weight.is_bit = True
-        self.weight.bit_scale = self.scale
-
-        self.in_scale = nn.Parameter(
-            torch.randn(self.scale_rank, in_features) * 0.1
-            / self.scale
-        )
-        self.out_scale = nn.Parameter(
-            torch.randn(out_features, self.scale_rank) * 0.1
-            / self.scale
-        )
-        self.out_shift = nn.Parameter(
-            torch.zeros(out_features)
-        )
 
 
     def forward(self, x: Tensor, quant_scale: Tensor|None) -> Tensor:
         
-        m, b = self.get_matrix(quant_scale)
-        m = m.to(x.dtype) # see CastedLinear
-        b = b.to(x.dtype)
+        # see CastedLinear
+        w = self.weight.to(x.dtype) 
+        b = self.bias.to(x.dtype) if self.bias is not None else None
 
         if quant_scale is None:
-            return F.linear(x, b, bias=self.out_shift.to(x.dtype))
+            return F.linear(x, w, bias=b)
+
+        q = self.get_quantized(quant_scale).to(x.dtype)
 
         x_mean = x.mean(dim=[0,1], keepdim=True)
         x = x - x_mean
 
-        y = F.linear(x, b, bias=self.out_shift.to(x.dtype))
-        y_mean = F.linear(x_mean, m)
+        y = F.linear(x, q, bias=b)
+        y_mean = F.linear(x_mean, w)
 
         return y + y_mean
 
 
-    def get_matrix(self, quant_scale: Tensor|None) -> tuple[Tensor, Tensor]:
+    def get_quantized(self, quant_scale: Tensor|None) -> tuple[Tensor, Tensor]:
 
-        # scale brings up to unit range
-        m = self.weight * self.scale
-        b = QuantFunction.apply(m, self.quant_steps, quant_scale)
+        if quant_scale is None:
+            return self.weight, self.weight
 
-        # scale with LoRA
-        matrix_scale = 2.0 * (
-            STEELU.apply(self.out_scale * self.scale) @ STEELU.apply(self.in_scale * self.scale)
-        ) / (self.scale * self.scale_rank)
-        
-        m = MatrixScale.apply(m, matrix_scale)
-        b = MatrixScale.apply(b, matrix_scale)
+        w = self.weight
 
-        return m, b
+        # normalize rows
+        row_norm = w.norm(dim=1, keepdim=True)
+        w = w / row_norm
 
-    
-@torch.no_grad()
-def clamp_weight(weight) -> None:
-    weight.clamp_(-1.0 / weight.bit_scale, 1.0 / weight.bit_scale)
+        # normalize columns and scale to 1/2 rms
+        col_norm = 2 * w.norm(dim=0, keepdim=True) / math.sqrt(w.shape[0])
+        w = w / col_norm
 
-
-def get_density(weight) -> Tensor:
-
-    b = weight * weight.bit_scale
-    p = b.abs()
-
-    return p.sum().float(), p.numel()
+        # quantize and scale
+        return (
+            QuantFunction.apply(w, self.quant_steps, quant_scale)
+            * row_norm * col_norm
+        )
 
 
-def get_confidence(weight) -> Tensor:
+def quantize_parameter(x, quant_steps: int):
 
-    w = weight * weight.bit_scale
-    p = w.abs()
+    x = x / x.norm(dim=1, keepdim=True)
+    x = x / (2 * x.norm(dim=-2, keepdim=True) / math.sqrt(x.shape[-2]))
 
-    flip = 0.5 - torch.abs(p - 0.5)
+    x = QuantFunction.apply(x, quant_steps, 1.0)
 
-    return flip.sum().float(), p.numel()
+    x = quant_steps * (x + 1)
+
+    return x.round().to(torch.uint8)
 
 
 class CastedLinear(nn.Linear):
@@ -989,25 +955,15 @@ class CausalConv(nn.Module):
         return c
 
 
-class LayerConv(nn.Module):
+class STEELU(torch.autograd.Function):
 
-    def __init__(self, dim: int, layer: int):
-        super().__init__()
-        
-        self.dim = dim
-        self.layer = layer
+    @staticmethod
+    def forward(ctx, x: Tensor) -> Tensor:
+        return F.elu(x) + 1.0
 
-        self.weight = nn.Parameter(torch.zeros(layer, dim))
-
-
-    def forward(self, x) -> Tensor:
-        assert x.shape[-1] == self.layer
-
-        w = torch.softmax(
-            self.weight.view(1, 1, self.dim, self.layer), dim=-1
-        )
-
-        return (x * w).sum(dim=-1)
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> Tensor:
+        return grad_output
 
 
 class Rotary(nn.Module):
@@ -1063,7 +1019,6 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         res_init_scale: float,
         quant_steps: int,
-        scale_rank: int,
         mask_emb_dim: int,
     ):
         super().__init__()
@@ -1071,28 +1026,31 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
             raise ValueError("num_heads must be divisible by num_kv_heads")
+        
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.emb_head_dim = self.head_dim - mask_emb_dim
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        
         self.q_dim = self.num_heads * self.emb_head_dim
         self.k_dim = self.num_kv_heads * self.emb_head_dim
         self.v_dim = self.num_kv_heads * self.head_dim
         self.qkv_dim = self.q_dim + self.k_dim + self.v_dim
         self.conv_dim = self.v_dim // 2
-        self.c_qkv = BitLinear(
-            dim,
-            self.qkv_dim + self.num_kv_heads,
-            quant_steps, scale_rank
-        )
-        self.proj = BitLinear(dim, dim, quant_steps, scale_rank, init_scale=res_init_scale)
+        
+        self.c_qkv = QuantLinear(dim, self.qkv_dim + self.num_kv_heads, quant_steps)
+        self.proj = QuantLinear(dim, dim, quant_steps)
+        self.proj.init_scale = res_init_scale
+        
         self.qk_gain = nn.Parameter(torch.ones(1, self.num_heads, 1, 1) * (qk_gain_init - 1.0))
-        self.rotary = Rotary(self.head_dim // 2, base=rope_base)
+        
         self.k_conv = CausalConv(self.k_dim, 4, zero_init=True)
         self.v_conv = CausalConv(self.v_dim, 4, out_dim=self.conv_dim, inclusive=False, groups=self.num_kv_heads)
         
+        self.rotary = Rotary(self.head_dim // 2, base=rope_base)
+
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Subtract self-value projection via GQA-aware reshape (no repeat_interleave)."""
         B, H, T, D = y.shape
@@ -1187,11 +1145,12 @@ def sqelu(x: Tensor) -> Tensor:
 
 class MLP(nn.Module):
 
-    def __init__(self, dim: int, mlp_mult: int, quant_steps: int, scale_rank: int, res_init_scale: float):
+    def __init__(self, dim: int, mlp_mult: int, quant_steps: int, res_init_scale: float):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = BitLinear(dim, hidden, quant_steps, scale_rank)
-        self.proj = BitLinear(hidden, dim, quant_steps, scale_rank, init_scale=res_init_scale)
+        self.fc = QuantLinear(dim, hidden, quant_steps)
+        self.proj = QuantLinear(hidden, dim, quant_steps)
+        self.proj.init_scale = res_init_scale
 
     def forward(self, x: Tensor, quant_scale: Tensor) -> Tensor:
         x = self.fc(x, quant_scale)
@@ -1221,16 +1180,14 @@ class Block(nn.Module):
         qk_gain_init: float,
         res_init_scale: float,
         quant_steps: int,
-        scale_rank: int,
-        hyper_dim: int,
         mask_emb_dim: int,
     ):
         super().__init__()
         self.layer_index = layer_index
         self.attn_norm = RMSNorm() # matrices have in_scales for affine
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, res_init_scale, quant_steps, scale_rank, mask_emb_dim)
-        self.mlp = MLP(dim, mlp_mult, quant_steps, scale_rank, res_init_scale)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, res_init_scale, quant_steps, mask_emb_dim)
+        self.mlp = MLP(dim, mlp_mult, quant_steps, res_init_scale)
         self.attn_x_mix = nn.Parameter(torch.zeros(dim))
         self.attn_x0_mix = nn.Parameter(torch.zeros(dim))
         self.mlp_x_mix = nn.Parameter(torch.zeros(dim))
@@ -1278,10 +1235,7 @@ class StackedLayers(nn.Module):
             
             p = nn.Parameter(x, requires_grad=ref.requires_grad)       
             
-            p.is_bit = getattr(ref, "is_bit", False)
-            if p.is_bit:
-                p.bit_scale = ref.bit_scale
-
+            p.is_quant = getattr(ref, "is_quant", False)
             p.is_2d = getattr(ref, "is_2d", ref.ndim == 2)
 
             self.register_parameter(safe_name(key), p)
@@ -1339,8 +1293,6 @@ class GPT(nn.Module):
                     h.qk_gain_init,
                     h.res_init_scale,
                     h.quant_steps,
-                    h.scale_rank,
-                    h.hyper_dim,
                     h.mask_emb_dim,
                 )
                 for i in range(h.num_layers)
@@ -1416,35 +1368,6 @@ class GPT(nn.Module):
         return loss
 
 
-    def get_density(self) -> Tensor:
-        total_p = 0.0
-        total_count = 0
-        for p in self.parameters():
-            if getattr(p, "is_bit", False) and not getattr(p, "ignore", False):
-                p_sum, numel = get_density(p)
-                total_p = total_p + p_sum
-                total_count = total_count + numel
-        return total_p / (total_count + 1e-6)
-
-
-    def get_confidence(self) -> Tensor:
-        total_flip = 0.0
-        total_count = 0
-        for p in self.parameters():
-            if getattr(p, "is_bit", False) and not getattr(p, "ignore", False):
-                flip_sum, numel = get_confidence(p)
-                total_flip = total_flip + flip_sum
-                total_count = total_count + numel
-        return 1.0 - (total_flip / (total_count + 1e-6))
-
-
-    @torch.no_grad()    
-    def clamp_weights(self) -> None:
-        for p in self.parameters():
-            if getattr(p, "is_bit", False) and not getattr(p, "ignore", False):
-                clamp_weight(p)
-
-
 # -----------------------------
 # Training
 # -----------------------------
@@ -1458,19 +1381,19 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True, disable=(not h.compile))
     model: nn.Module = DDP(compiled_model, device_ids=[h.local_rank], broadcast_buffers=False) if h.distributed else compiled_model
 
+    optimizers = Optimizers(h, base_model)
+    train_loader = ShuffledSequenceLoader(h, device)
+
     n_params = sum(p.numel() for p in base_model.parameters() if not getattr(p, "ignore", False))
     n_bytes = 0
     for p in base_model.parameters():
         if not getattr(p, "ignore", False):
-            if getattr(p, "is_bit", False):
+            if getattr(p, "is_quant", False):
                 n_bytes += p.numel() * math.log2(h.quant_steps) / 8
             else:
                 n_bytes += p.numel()
     log(f"model params:{n_params:_}")
     log(f"model bytes:{int(n_bytes):_}")
-
-    optimizers = Optimizers(h, base_model)
-    train_loader = ShuffledSequenceLoader(h, device)
 
     max_wallclock_ms = 1000.0 * h.max_wallclock_seconds if h.max_wallclock_seconds > 0 else None
 
@@ -1512,8 +1435,8 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
 
         optimizers.step()
-        if hasattr(base_model, "clamp_weights"):
-            base_model.clamp_weights()
+        if hasattr(base_model, "post_step"):
+            base_model.post_step()
 
         return train_loss
 
@@ -1594,9 +1517,7 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         if should_log_train:
             log(
                 f"step:{step}/{h.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.1f}ms "
-                f"density:{base_model.get_density().item():.3f} "
-                f"confidence:{base_model.get_confidence().item():.3f} " +
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.1f}ms " +
                 (f"quant:{quant_scale:.3f}" if quant_scale is not None else "quant:None")
             )
 
@@ -1628,9 +1549,6 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
 
     base_model, compiled_model = train_model(h, device, val_data)
 
-    timed_eval("pre-quantization", eval_val, h, device, val_data, compiled_model)
-    timed_eval("pre-quantization_sliding_window", eval_val_sliding, h, device, val_data, compiled_model)
-
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
@@ -1646,6 +1564,19 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
         log(f"Serialized model: {model_bytes} bytes")
         log(f"Code size: {code_bytes} bytes")
         log(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    state_dict = quantize_model(base_model, h)
+    buf = io.BytesIO()
+    torch.save(state_dict, buf)
+    bytes = buf.getvalue()
+    log(f"Uncompressed model bytes: {len(bytes):_}")
+    blob = brotli.compress(bytes)
+    log(f"Compressed model bytes: {len(blob):_}")
+
+    return
+
+    timed_eval("pre-quantization", eval_val, h, device, val_data, compiled_model)
+    timed_eval("pre-quantization_sliding_window", eval_val_sliding, h, device, val_data, compiled_model)
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model)
     quant_buf = io.BytesIO()

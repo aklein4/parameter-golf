@@ -913,7 +913,7 @@ class BitLinear(nn.Module):
     def get_matrix(self, quant_scale: Tensor|None) -> tuple[Tensor, Tensor]:
 
         # scale brings up to unit range
-        m = self.weight * self.scale
+        m = self.weight # * self.scale
         b = QuantFunction.apply(m, self.quant_steps, quant_scale)
 
         # scale with LoRA
@@ -921,14 +921,18 @@ class BitLinear(nn.Module):
             STEELU.apply(self.out_scale * self.scale) @ STEELU.apply(self.in_scale * self.scale)
         ) / (self.scale * self.scale_rank)
         
-        m = MatrixScale.apply(m, matrix_scale)
-        b = MatrixScale.apply(b, matrix_scale)
+        # m = MatrixScale.apply(m, matrix_scale)
+        # b = MatrixScale.apply(b, matrix_scale)
 
-        return m, b
+        # m = m * matrix_scale
+        # b = b * matrix_scale
+
+        return m, m
 
     
 @torch.no_grad()
 def clamp_weight(weight) -> None:
+    return
     weight.clamp_(-1.0 / weight.bit_scale, 1.0 / weight.bit_scale)
 
 
