@@ -64,8 +64,9 @@ class Hyperparameters():
     model_dim = int(os.environ.get('MODEL_DIM', 512))
     embedding_dim = int(os.environ.get('EMBEDDING_DIM', 512))
     num_kv_heads = int(os.environ.get('NUM_KV_HEADS', 4))
+    head_dim = int(os.environ.get('HEAD_DIM', 64))
     num_heads = int(os.environ.get('NUM_HEADS', 8))
-    mlp_mult = float(os.environ.get('MLP_MULT', 4.0))
+    mlp_size = int(os.environ.get('MLP_SIZE', 2048))
     skip_gates_enabled = bool(int(os.environ.get('SKIP_GATES_ENABLED', '1')))
     tie_embeddings = bool(int(os.environ.get('TIE_EMBEDDINGS', '1')))
     logit_softcap = float(os.environ.get('LOGIT_SOFTCAP', 30.0))
@@ -406,17 +407,17 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0, ma
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
+    def __init__(self, dim: int, head_dim: int, num_heads: int, num_kv_heads: int,
                  rope_base: float, qk_gain_init: float, train_seq_len: int):
         super().__init__()
         self.mask_emb_dim = 4
-        if dim % num_heads != 0:
+        if dim % num_heads != 0 and False:
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
             raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = head_dim
         self.emb_head_dim = self.head_dim - self.mask_emb_dim
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
@@ -424,7 +425,7 @@ class CausalSelfAttention(nn.Module):
         self.c_q = CastedLinear(dim, self.num_heads * self.emb_head_dim, bias=False)
         self.c_k = CastedLinear(dim, self.num_kv_heads * self.emb_head_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj = CastedLinear(self.num_heads * self.head_dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rope_dims = 0
@@ -466,7 +467,7 @@ class CausalSelfAttention(nn.Module):
         ).transpose(1, 2).contiguous()
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
-        y = y.reshape(bsz, seqlen, dim)
+        y = y.reshape(bsz, seqlen, self.proj.in_features)
         return self.proj(y)
 
 
@@ -502,9 +503,9 @@ def sqilu(x: Tensor) -> Tensor:
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_size: int):
         super().__init__()
-        hidden = int(mlp_mult * dim)
+        hidden = mlp_size
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -521,15 +522,15 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+    def __init__(self, dim: int, head_dim: int, num_heads: int, num_kv_heads: int, mlp_size: int,
                  rope_base: float, qk_gain_init: float, train_seq_len: int,
                  layer_idx: int = 0, ln_scale: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len)
-        self.mlp = MLP(dim, mlp_mult)
+            dim, head_dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len)
+        self.mlp = MLP(dim, mlp_size)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -587,6 +588,38 @@ class MaskEmbedding(nn.Module):
         return emb_q, emb_k
 
 
+class CausalConv(nn.Module):
+
+    def __init__(self, dim: int, kernel_size: int, **kwargs):
+        super().__init__()
+
+        self.kernel_size = kernel_size
+        self.inclusive = kwargs.get("inclusive", True)
+
+        self.denom = math.sqrt(
+            self.kernel_size * dim // kwargs.get("groups", dim)
+        )
+
+        self.conv = nn.Conv1d(
+            dim, kwargs.get("out_dim", dim),
+            groups=kwargs.get("groups", dim),
+            kernel_size=kernel_size,
+            padding=(kernel_size-1 if self.inclusive else kernel_size),
+            bias=False
+        )
+        if kwargs.get("zero_init", False):
+            nn.init.zeros_(self.conv.weight)
+        else:
+            nn.init.normal_(self.conv.weight)
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        c = x.transpose(1, 2)
+        c = self.conv(c)[..., :-(self.kernel_size-1 if self.inclusive else self.kernel_size+1)] / self.denom
+        c = c.transpose(1, 2)
+        return c
+
+
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
@@ -596,6 +629,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
         self.tok_emb = nn.Embedding(h.vocab_size, h.embedding_dim)
+        self.tok_conv = CausalConv(h.model_dim, 8, zero_init=True)
         if h.embedding_dim != h.model_dim:
             self.embed_proj = CastedLinear(h.embedding_dim, h.model_dim, bias=False)
             self.head_proj = CastedLinear(h.model_dim, h.embedding_dim, bias=False)
@@ -605,15 +639,14 @@ class GPT(nn.Module):
         self.num_encoder_layers = h.num_layers // 2
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
         self.blocks = nn.ModuleList([
-            Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
+            Block(h.model_dim, h.head_dim, h.num_heads, h.num_kv_heads, h.mlp_size, h.rope_base,
                   h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale)
             for i in range(h.num_layers)
         ])
         if h.rope_dims > 0:
-            head_dim = h.model_dim // h.num_heads
             for block in self.blocks:
                 block.attn.rope_dims = h.rope_dims
-                block.attn.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
+                block.attn.rotary = Rotary(h.head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
         self.final_norm = RMSNorm()
         self.lm_head = None if h.tie_embeddings else CastedLinear(h.embedding_dim, h.vocab_size, bias=False)
         if self.lm_head is not None:
@@ -675,7 +708,7 @@ class GPT(nn.Module):
             override = {}
             for layer_idx in range(h.loop_start, h.loop_end + 1):
                 for pass_num in range(1, h.num_loops + 1):
-                    override[f"{layer_idx}_p{pass_num}"] = MLP(h.model_dim, h.mlp_mult)
+                    override[f"{layer_idx}_p{pass_num}"] = MLP(h.model_dim, h.mlp_size)
             self.override_mlps = nn.ModuleDict(override)
 
         self.mask_embedding = MaskEmbedding(
@@ -727,6 +760,8 @@ class GPT(nn.Module):
         mask_emb = self.mask_embedding(input_ids)
         
         x = self.tok_emb(input_ids)
+        if bool(int(os.environ.get("TOK_CONV", "0"))):
+            x = x + self.tok_conv(x)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
             x = self.embed_proj(x)
@@ -884,7 +919,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,k_conv_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,k_conv_scale,conv",
     ).split(",")
     if pattern
 )
@@ -1972,4 +2007,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
